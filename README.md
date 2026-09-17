@@ -18,7 +18,7 @@ Le fichier de sortie est structuré pour être directement exploitable par un ou
 - **Timestamps** optionnels (par segment ou par mot)
 - **Context biasing** (jusqu'à 100 termes pour guider la transcription de noms propres)
 - Détection automatique de la langue ou forçage manuel
-- Vérification des limites API (3h max, 500 MB max)
+- **Découpage automatique** des vidéos longues (>3h) en chunks, transcription séparée puis fusion en un seul fichier
 - Sortie en Markdown structuré avec métadonnées
 - Nettoyage automatique du fichier audio temporaire
 
