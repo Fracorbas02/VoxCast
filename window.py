@@ -238,7 +238,7 @@ class VoxCastWindow:
             hexpand=True,
         )
         self.url_entry.connect("activate", lambda *_: self.on_add_to_queue())
-        self.url_entry.connect("changed", lambda *_: self._check_source_type())
+        self.url_entry.connect("changed", lambda *_: self._on_source_changed())
 
         browse_btn = Gtk.Button(
             icon_name="document-open-symbolic",
@@ -819,9 +819,6 @@ class VoxCastWindow:
         """Démarre le traitement de la file d'attente."""
         if self.running:
             return
-        if not self.api_key:
-            self.log_message("Aucune clé API Mistral. Ouvrez Paramètres.", "red")
-            return
         if not vtt.check_ffmpeg():
             self.log_message("ffmpeg requis. Installez-le.", "red")
             return
@@ -829,6 +826,14 @@ class VoxCastWindow:
         pending = [q for q in self.queue if q.status == STATUS_PENDING]
         if not pending:
             self.log_message("Aucun élément en attente.")
+            return
+
+        self._ensure_api_key(self._start_queue_actual)
+
+    def _start_queue_actual(self):
+        """Démarre effectivement le traitement de la file."""
+        pending = [q for q in self.queue if q.status == STATUS_PENDING]
+        if not pending:
             return
 
         self.running = True
@@ -1285,9 +1290,58 @@ class VoxCastWindow:
     # URL CHANGED
     # ========================================================================
 
-    def on_url_changed(self, entry):
-        url = entry.get_text().strip()
+    def _on_source_changed(self):
+        """Gère le changement de source : active le bouton et lance l'estimation."""
+        url = self.url_entry.get_text().strip()
         self.add_queue_btn.set_sensitive(bool(url) and not self.running)
+        self._check_source_type()
+
+    def _ensure_api_key(self, on_success) -> bool:
+        """
+        Vérifie que la clé API est présente. Si absente, ouvre un dialogue
+        pour la saisir. on_success est appelé si la clé est disponible.
+        Retourne True si la clé était déjà présente (pas de dialogue affiché).
+        """
+        if self.api_key:
+            on_success()
+            return True
+
+        dialog = Adw.MessageDialog(
+            transient_for=self.window,
+            title="Clé API Mistral requise",
+            body="Aucune clé API Mistral n'est configurée.\n"
+                 "Saisissez votre clé pour continuer (elle sera sauvegardée).",
+            modal=True,
+        )
+
+        entry = Gtk.Entry(
+            placeholder_text="votre-cle-api...",
+            hexpand=True,
+            margin_top=10,
+            margin_bottom=10,
+        )
+        entry.set_visibility(False)  # Masquer la clé
+        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        content_box.append(entry)
+        dialog.set_extra_child(content_box)
+
+        dialog.add_response("cancel", "Annuler")
+        dialog.add_response("save", "Enregistrer")
+        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+
+        def on_response(d, response):
+            if response == "save":
+                key = entry.get_text().strip()
+                if key:
+                    self.api_key = key
+                    self.save_settings()
+                    self.log_message("Clé API enregistrée.", "green")
+                    on_success()
+            d.destroy()
+
+        dialog.connect("response", on_response)
+        dialog.present()
+        return False
 
     # ========================================================================
     # UTILITAIRES
