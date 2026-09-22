@@ -607,7 +607,7 @@ class VoxCastWindow:
     # ========================================================================
 
     def _show_cost_estimate(self, source: str, is_local: bool):
-        """Affiche une estimation du coût et de la durée."""
+        """Affiche une estimation du coût et de la durée, et auto-remplit le nom."""
         if not source:
             self.cost_label.set_label("")
             return
@@ -620,6 +620,10 @@ class VoxCastWindow:
                     f"Durée: {vtt.format_timestamp(duration)} | "
                     f"Coût estimé: ${cost:.2f}"
                 )
+                # Auto-remplir avec le nom du fichier
+                if not self.name_entry.get_text().strip():
+                    auto_name = vtt.sanitize_filename(Path(source).stem)
+                    self.name_entry.set_text(auto_name)
             elif source.startswith("http"):
                 # Pour les URLs, on fetch les infos (avec cache)
                 info = vtt.get_video_info_cached(source)
@@ -629,6 +633,12 @@ class VoxCastWindow:
                     f"Durée: {vtt.format_timestamp(duration)} | "
                     f"Coût estimé: ${cost:.2f}"
                 )
+                # Auto-remplir avec le titre de la vidéo
+                if not self.name_entry.get_text().strip():
+                    title = info.get("title", "")
+                    if title:
+                        auto_name = vtt.sanitize_filename(title)
+                        self.name_entry.set_text(auto_name)
             else:
                 self.cost_label.set_label("")
         except Exception:
