@@ -86,20 +86,36 @@ class GlibLogStream(io.TextIOBase):
     """Redirige les prints vers le log panel de l'UI (thread-safe)."""
     def __init__(self, callback):
         self.callback = callback
-        self.buffer = ""
+        self._buf = ""
 
     def write(self, text):
-        self.buffer += text
-        while "\n" in self.buffer:
-            line, self.buffer = self.buffer.split("\n", 1)
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
             if line.strip():
                 GLib.idle_add(self.callback, line)
         return len(text)
 
     def flush(self):
-        if self.buffer.strip():
-            GLib.idle_add(self.callback, self.buffer)
-            self.buffer = ""
+        if self._buf.strip():
+            GLib.idle_add(self.callback, self._buf)
+            self._buf = ""
+
+    # Ces propriétés sont nécessaires car io.TextIOBase les attend
+    @property
+    def encoding(self):
+        return "utf-8"
+
+    @property
+    def writable(self):
+        return True
+
+    @property
+    def readable(self):
+        return False
+
+    def fileno(self):
+        raise OSError("GlibLogStream n'a pas de file descriptor")
 
 
 # ============================================================================
@@ -444,6 +460,13 @@ class VoxCastWindow:
         )
         self.clear_done_btn.connect("clicked", self.on_clear_done)
 
+        self.retry_btn = Gtk.Button(
+            label="Réessayer",
+            icon_name="view-refresh-symbolic",
+            tooltip_text="Remettre les éléments en erreur dans la file",
+        )
+        self.retry_btn.connect("clicked", self.on_retry_failed)
+
         self.remove_selected_btn = Gtk.Button(
             label="Retirer",
             icon_name="list-remove-symbolic",
@@ -451,6 +474,7 @@ class VoxCastWindow:
         )
         self.remove_selected_btn.connect("clicked", self.on_remove_queue_item)
 
+        queue_buttons.append(self.retry_btn)
         queue_buttons.append(self.clear_done_btn)
         queue_buttons.append(self.remove_selected_btn)
         queue_box.append(queue_buttons)
@@ -814,6 +838,15 @@ class VoxCastWindow:
         self.queue = [q for q in self.queue if q.status in (STATUS_PENDING, STATUS_RUNNING)]
         self._refresh_queue_list()
         self.start_btn.set_sensitive(len(self.queue) > 0)
+
+    def on_retry_failed(self, button=None):
+        """Remet les éléments en erreur ou annulés en attente."""
+        for item in self.queue:
+            if item.status in (STATUS_ERROR, STATUS_CANCELLED):
+                item.status = STATUS_PENDING
+                item.error = None
+        self._refresh_queue_list()
+        self.log_message("Éléments remis en file d'attente.")
 
     def on_start_queue(self, button=None):
         """Démarre le traitement de la file d'attente."""
