@@ -6,6 +6,7 @@ Le pipeline est simple :
 
 ```
 URL YouTube → yt-dlp (audio MP3 128kbps) → Mistral Voxtral API → fichier Markdown
+Fichier local → ffmpeg (audio MP3) → Mistral Voxtral API → fichier Markdown
 ```
 
 Le fichier de sortie est structuré pour être directement exploitable par un outil d'analyse comme [Vibe](https://mistral.ai/products/vibe) : recherche, synthèse, résumé, extraction d'informations.
@@ -13,6 +14,7 @@ Le fichier de sortie est structuré pour être directement exploitable par un ou
 ## Fonctionnalités
 
 - Téléchargement audio via `yt-dlp` (MP3 128kbps, optimisé pour la parole)
+- **Support des fichiers audio locaux** (MP3, WAV, M4A, OGG, FLAC...) en plus de YouTube
 - Transcription via l'API Mistral Voxtral (`voxtral-mini-latest`)
 - **Diarisation** optionnelle (identification des speakers)
 - **Timestamps** optionnels (par segment ou par mot)
@@ -20,9 +22,17 @@ Le fichier de sortie est structuré pour être directement exploitable par un ou
 - Détection automatique de la langue ou forçage manuel (13 langues)
 - **Découpage automatique** des vidéos longues (>3h) en chunks, transcription séparée puis fusion en un seul fichier
 - **Découpage parallèle** des chunks via ffmpeg multi-threaded (tous les coeurs CPU)
+- **Reprise sur échec** : retry automatique des chunks échoués (3 tentatives)
+- **Cache des métadonnées** : évite de re-fetcher les infos YouTube
+- **Transcription partielle** : extraire et transcrire un segment précis (ex: 10:00 → 30:00)
+- **Export SRT / VTT** : génère des sous-titres depuis la transcription
+- **Estimation du coût** : affiche la durée et le coût avant de lancer
 - Sortie en Markdown structuré avec métadonnées
 - Nettoyage automatique du fichier audio temporaire
 - **Interface graphique GTK4 + Libadwaita** (style GNOME natif)
+  - **File d'attente** : ajoutez plusieurs vidéos, traitez-les les unes après les autres
+  - **Recherche** dans les transcriptions par nom ou par contenu
+  - **Glisser-déposer** de fichiers audio directement dans la fenêtre
 - **CLI** pour automatisation et scripts
 
 ## Prérequis
@@ -76,15 +86,20 @@ Ou saisissez-la dans l'interface graphique via Paramètres > Clé API.
 ```
 
 L'interface permet de :
-- Coller une URL YouTube et lancer la transcription
-- Choisir la langue, les timestamps, la diarisation, le context bias
-- Suivre la progression en temps réel (téléchargement → découpage → transcription → sauvegarde)
-- Consulter le log détaillé
-- Ouvrir, supprimer les transcriptions depuis la liste
+- Saisir une URL YouTube ou un chemin de fichier local (ou glisser-déposer un fichier)
+- Voir l'estimation du coût et de la durée en temps réel
+- Configurer la langue, timestamps, diarisation, context bias, export SRT/VTT
+- Spécifier un segment précis (transcription partielle)
+- Ajouter plusieurs sources à la **file d'attente**
+- Démarrer/annuler le traitement de la file
+- Suivre la progression en temps réel
+- **Rechercher** dans les transcriptions par nom ou par contenu
+- Ouvrir, supprimer, exporter en SRT/VTT les transcriptions
 - Configurer la clé API et le dossier de sortie
 
 **Raccourcis clavier :**
-- `Ctrl+Entrée` : Lancer la transcription
+- `Ctrl+Entrée` : Ajouter à la file
+- `Ctrl+Espace` : Démarrer la file
 - `Ctrl+Q` : Annuler
 - `Ctrl+R` : Rafraîchir la liste
 - `Ctrl+O` : Ouvrir la transcription sélectionnée
@@ -99,14 +114,26 @@ L'interface permet de :
 # Avec langue forcée (recommandé)
 ./venv/bin/python3 video_to_text.py "https://youtube.com/watch?v=..." --language fr
 
+# Fichier audio local
+./venv/bin/python3 video_to_text.py /path/to/audio.mp3 --language fr
+
+# Transcription partielle (segment)
+./venv/bin/python3 video_to_text.py "https://youtube.com/watch?v=..." --start 10:00 --end 30:00
+
 # Avec diarisation + timestamps par segment
 ./venv/bin/python3 video_to_text.py "https://youtube.com/watch?v=..." -d -t segment
+
+# Avec export SRT + VTT
+./venv/bin/python3 video_to_text.py "https://youtube.com/watch?v=..." --srt --vtt
 
 # Avec context bias (noms propres, termes techniques)
 ./venv/bin/python3 video_to_text.py "https://youtube.com/watch?v=..." -b "Mistral" "Voxtral" "ASR"
 
 # Conserver le fichier MP3 après transcription
 ./venv/bin/python3 video_to_text.py "https://youtube.com/watch?v=..." --keep-audio
+
+# Désactiver le cache des métadonnées
+./venv/bin/python3 video_to_text.py "https://youtube.com/watch?v=..." --no-cache
 ```
 
 Les transcriptions sont sauvegardées dans `transcripts/` au format Markdown.
@@ -122,6 +149,12 @@ Les transcriptions sont sauvegardées dans `transcripts/` au format Markdown.
 | `-o, --output` | Nom du fichier de sortie (sans extension). |
 | `--keep-audio` | Conserve le fichier MP3 après transcription. |
 | `--api-key` | Clé API Mistral (sinon lit `MISTRAL_API_KEY`). |
+| `--start` | Début du segment (HH:MM:SS, MM:SS ou secondes). |
+| `--end` | Fin du segment (HH:MM:SS, MM:SS ou secondes). |
+| `--no-cache` | Désactive le cache des métadonnées YouTube. |
+| `--srt` | Exporte aussi en SRT (sous-titres). |
+| `--vtt` | Exporte aussi en VTT (sous-titres WebVTT). |
+| `--file` | Force la source comme fichier local (auto-détecté sinon). |
 
 Note : `--timestamps` et `--language` ne sont pas compatibles simultanément (limitation API Mistral).
 
@@ -134,8 +167,9 @@ VoxCast/
 ├── video_to_text.py     # Logique principale (CLI + pipeline)
 ├── requirements.txt     # Dépendances (yt-dlp, mistralai, PyGObject)
 ├── settings.json        # Paramètres utilisateur (généré)
+├── .cache.json          # Cache des métadonnées YouTube (généré)
 ├── downloads/           # MP3 temporaires (auto-nettoyés)
-└── transcripts/         # Transcriptions .md de sortie
+└── transcripts/         # Transcriptions .md, .srt, .vtt de sortie
 ```
 
 ## Projets liés

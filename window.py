@@ -30,7 +30,7 @@ import video_to_text as vtt
 APP_ID = "com.voxcast.app"
 APP_DIR = Path(__file__).parent
 DEFAULT_TRANSCRIPTS_DIR = APP_DIR / "transcripts"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 LANGUAGES = [
     ("auto", "Auto-détection"),
@@ -53,6 +53,29 @@ TIMESTAMP_OPTIONS = [
     ("segment", "Par segment"),
     ("word", "Par mot"),
 ]
+
+# Statuts de la file d'attente
+STATUS_PENDING = "pending"
+STATUS_RUNNING = "running"
+STATUS_DONE = "done"
+STATUS_ERROR = "error"
+STATUS_CANCELLED = "cancelled"
+
+STATUS_LABELS = {
+    STATUS_PENDING: "En attente",
+    STATUS_RUNNING: "En cours",
+    STATUS_DONE: "Terminé",
+    STATUS_ERROR: "Erreur",
+    STATUS_CANCELLED: "Annulé",
+}
+
+STATUS_COLORS = {
+    STATUS_PENDING: "dim-label",
+    STATUS_RUNNING: "success",
+    STATUS_DONE: "success",
+    STATUS_ERROR: "error",
+    STATUS_CANCELLED: "dim-label",
+}
 
 
 # ============================================================================
@@ -80,6 +103,23 @@ class GlibLogStream(io.TextIOBase):
 
 
 # ============================================================================
+# ITEM DE LA FILE D'ATTENTE
+# ============================================================================
+
+class QueueItem:
+    """Représente un élément de la file d'attente de transcription."""
+    def __init__(self, source: str, is_local: bool, options: dict):
+        self.source = source
+        self.is_local = is_local
+        self.options = options  # language, diarize, timestamps, etc.
+        self.status = STATUS_PENDING
+        self.error = None
+        self.output_path: Optional[Path] = None
+        self.row_widget: Optional[Gtk.Widget] = None
+        self.status_label: Optional[Gtk.Label] = None
+
+
+# ============================================================================
 # CLASSE PRINCIPALE DE L'INTERFACE
 # ============================================================================
 
@@ -95,23 +135,27 @@ class VoxCastWindow:
         self.api_key = ""
         self.transcripts_dir = DEFAULT_TRANSCRIPTS_DIR
         self.running = False
-        self.thread: Optional[threading.Thread] = None
+        self.cancelled = False
+        self.queue: list[QueueItem] = []
+        self.queue_thread: Optional[threading.Thread] = None
         self.selected_transcript: Optional[dict] = None
+        self.all_transcripts: list[dict] = []
 
         self.load_settings()
-
-        # Pour le cancel
-        self.cancelled = False
-
         self.window = None
 
     def on_activate(self, app):
         self.window = Gtk.ApplicationWindow(
             application=app,
             title=f"VoxCast v{VERSION}",
-            default_width=950,
-            default_height=750,
+            default_width=1000,
+            default_height=800,
         )
+
+        # Support drag & drop de fichiers
+        dnd = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        dnd.connect("drop", self.on_drop_file)
+        self.window.add_controller(dnd)
 
         # ===== HEADER BAR =====
         header = Adw.HeaderBar()
@@ -130,7 +174,9 @@ class VoxCastWindow:
         main_box.set_margin_start(20)
         main_box.set_margin_end(20)
 
-        main_box.append(self._build_transcription_section())
+        main_box.append(self._build_source_section())
+        main_box.append(self._build_options_section())
+        main_box.append(self._build_queue_section())
         main_box.append(self._build_transcripts_section())
         main_box.append(self._build_status_section())
 
@@ -142,25 +188,69 @@ class VoxCastWindow:
         self.window.present()
 
     # ========================================================================
+    # DRAG & DROP
+    # ========================================================================
+
+    def on_drop_file(self, target, value, x, y):
+        """Gère le drop d'un fichier audio ou d'une URL."""
+        if hasattr(value, "get_files"):
+            # Gdk.FileList
+            for file_info in value.get_files():
+                path = file_info.get_path()
+                if path:
+                    self.url_entry.set_text(path)
+                    self._check_source_type()
+        elif isinstance(value, str):
+            self.url_entry.set_text(value)
+            self._check_source_type()
+
+    def _check_source_type(self):
+        """Vérifie si la source est une URL ou un fichier local."""
+        source = self.url_entry.get_text().strip()
+        is_local = not source.startswith("http")
+        self._show_cost_estimate(source, is_local)
+
+    # ========================================================================
     # CONSTRUCTION DES SECTIONS
     # ========================================================================
 
-    def _build_transcription_section(self) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup(title="Transcription")
+    def _build_source_section(self) -> Adw.PreferencesGroup:
+        group = Adw.PreferencesGroup(title="Source")
 
-        # URL
-        url_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        url_label = Gtk.Label(label="URL YouTube", halign=Gtk.Align.START)
-        url_label.add_css_class("caption")
+        # URL ou fichier
+        source_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        source_label = Gtk.Label(label="URL YouTube ou fichier audio", halign=Gtk.Align.START)
+        source_label.add_css_class("caption")
+
+        source_row = Gtk.Box(spacing=10)
         self.url_entry = Gtk.Entry(
-            placeholder_text="https://www.youtube.com/watch?v=...",
+            placeholder_text="https://www.youtube.com/watch?v=... ou glissez un fichier",
             hexpand=True,
         )
-        self.url_entry.connect("activate", lambda *_: self.on_transcribe_clicked())
-        self.url_entry.connect("changed", self.on_url_changed)
-        url_box.append(url_label)
-        url_box.append(self.url_entry)
-        group.add(url_box)
+        self.url_entry.connect("activate", lambda *_: self.on_add_to_queue())
+        self.url_entry.connect("changed", lambda *_: self._check_source_type())
+
+        browse_btn = Gtk.Button(
+            icon_name="document-open-symbolic",
+            tooltip_text="Parcourir un fichier audio",
+        )
+        browse_btn.connect("clicked", self.on_browse_audio)
+
+        source_row.append(self.url_entry)
+        source_row.append(browse_btn)
+
+        source_box.append(source_label)
+        source_box.append(source_row)
+        group.add(source_box)
+
+        # Estimation du coût
+        self.cost_label = Gtk.Label(
+            label="",
+            halign=Gtk.Align.START,
+            margin_top=5,
+        )
+        self.cost_label.add_css_class("dim-label")
+        group.add(self.cost_label)
 
         # Nom personnalisé
         name_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
@@ -174,15 +264,56 @@ class VoxCastWindow:
         name_box.append(self.name_entry)
         group.add(name_box)
 
-        # Ligne : langue + timestamps
+        # Segment (transcription partielle)
+        seg_box = Gtk.Box(spacing=15)
+        seg_label = Gtk.Label(label="Segment (optionnel)", halign=Gtk.Align.START)
+        seg_label.add_css_class("caption")
+
+        self.start_entry = Gtk.Entry(
+            placeholder_text="Début (HH:MM:SS)",
+            width_chars=12,
+        )
+        self.end_entry = Gtk.Entry(
+            placeholder_text="Fin (HH:MM:SS)",
+            width_chars=12,
+        )
+
+        seg_row = Gtk.Box(spacing=10)
+        seg_row.append(seg_label)
+        seg_row.append(self.start_entry)
+        dash_label = Gtk.Label(label="→")
+        seg_row.append(dash_label)
+        seg_row.append(self.end_entry)
+        group.add(seg_row)
+
+        # Boutons
+        buttons_box = Gtk.Box(spacing=10, halign=Gtk.Align.END, margin_top=10)
+
+        self.add_queue_btn = Gtk.Button(
+            label="Ajouter à la file",
+            icon_name="list-add-symbolic",
+            halign=Gtk.Align.END,
+        )
+        self.add_queue_btn.add_css_class("suggested-action")
+        self.add_queue_btn.connect("clicked", self.on_add_to_queue)
+        self.add_queue_btn.set_sensitive(False)
+
+        buttons_box.append(self.add_queue_btn)
+        group.add(buttons_box)
+
+        return group
+
+    def _build_options_section(self) -> Adw.PreferencesGroup:
+        group = Adw.PreferencesGroup(title="Options")
+
+        # Langue + Timestamps
         options_row = Gtk.Box(spacing=15)
 
-        # Langue
         lang_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         lang_label = Gtk.Label(label="Langue", halign=Gtk.Align.START)
         lang_label.add_css_class("caption")
         lang_model = Gtk.StringList()
-        for code, name in LANGUAGES:
+        for _, name in LANGUAGES:
             lang_model.append(name)
         self.lang_dropdown = Gtk.DropDown(model=lang_model)
         self.lang_dropdown.set_tooltip_text("Forcer la langue améliore la précision")
@@ -190,7 +321,6 @@ class VoxCastWindow:
         lang_box.append(self.lang_dropdown)
         options_row.append(lang_box)
 
-        # Timestamps
         ts_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         ts_label = Gtk.Label(label="Timestamps", halign=Gtk.Align.START)
         ts_label.add_css_class("caption")
@@ -204,18 +334,16 @@ class VoxCastWindow:
 
         group.add(options_row)
 
-        # Toggles : diarize + keep audio
+        # Toggles
         toggles_row = Gtk.Box(spacing=15)
 
-        # Diarize
         diarize_row = Adw.ActionRow(title="Diarisation", subtitle="Identifier les speakers")
         self.diarize_switch = Gtk.Switch(halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
         diarize_row.add_suffix(self.diarize_switch)
         diarize_row.set_activatable_widget(self.diarize_switch)
         toggles_row.append(diarize_row)
 
-        # Keep audio
-        keep_row = Adw.ActionRow(title="Garder l'audio", subtitle="Conserver le MP3 après transcription")
+        keep_row = Adw.ActionRow(title="Garder l'audio", subtitle="Conserver le MP3")
         self.keep_switch = Gtk.Switch(halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
         keep_row.add_suffix(self.keep_switch)
         keep_row.set_activatable_widget(self.keep_switch)
@@ -235,7 +363,24 @@ class VoxCastWindow:
         bias_box.append(self.bias_entry)
         group.add(bias_box)
 
-        # Boutons
+        # Export SRT/VTT
+        export_row = Gtk.Box(spacing=15)
+
+        srt_row = Adw.ActionRow(title="Export SRT", subtitle="Sous-titres SubRip")
+        self.srt_switch = Gtk.Switch(halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
+        srt_row.add_suffix(self.srt_switch)
+        srt_row.set_activatable_widget(self.srt_switch)
+        export_row.append(srt_row)
+
+        vtt_row = Adw.ActionRow(title="Export VTT", subtitle="Sous-titres WebVTT")
+        self.vtt_switch = Gtk.Switch(halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
+        vtt_row.add_suffix(self.vtt_switch)
+        vtt_row.set_activatable_widget(self.vtt_switch)
+        export_row.append(vtt_row)
+
+        group.add(export_row)
+
+        # Boutons start/stop
         buttons_box = Gtk.Box(spacing=10, halign=Gtk.Align.END, margin_top=10)
 
         self.cancel_btn = Gtk.Button(
@@ -245,23 +390,76 @@ class VoxCastWindow:
         )
         self.cancel_btn.connect("clicked", self.on_cancel_clicked)
 
-        self.transcribe_btn = Gtk.Button(
-            label="Transcrire",
+        self.start_btn = Gtk.Button(
+            label="Démarrer la file",
             icon_name="media-playback-start-symbolic",
             halign=Gtk.Align.END,
         )
-        self.transcribe_btn.add_css_class("suggested-action")
-        self.transcribe_btn.connect("clicked", self.on_transcribe_clicked)
-        self.transcribe_btn.set_sensitive(False)
+        self.start_btn.add_css_class("suggested-action")
+        self.start_btn.connect("clicked", self.on_start_queue)
+        self.start_btn.set_sensitive(False)
 
         buttons_box.append(self.cancel_btn)
-        buttons_box.append(self.transcribe_btn)
+        buttons_box.append(self.start_btn)
         group.add(buttons_box)
 
         return group
 
+    def _build_queue_section(self) -> Adw.PreferencesGroup:
+        group = Adw.PreferencesGroup(title="File d'attente")
+
+        self.queue_list = Gtk.ListBox(
+            selection_mode=Gtk.SelectionMode.SINGLE,
+            show_separators=True,
+            css_classes=["navigation-sidebar"],
+        )
+
+        scrolled = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            child=self.queue_list,
+        )
+        scrolled.set_size_request(-1, 100)
+
+        queue_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        queue_box.append(scrolled)
+
+        # Boutons de la file
+        queue_buttons = Gtk.Box(spacing=10, halign=Gtk.Align.END, margin_top=5)
+
+        self.clear_done_btn = Gtk.Button(
+            label="Nettoyer terminés",
+            icon_name="edit-clear-symbolic",
+            tooltip_text="Retirer les éléments terminés/annulés",
+        )
+        self.clear_done_btn.connect("clicked", self.on_clear_done)
+
+        self.remove_selected_btn = Gtk.Button(
+            label="Retirer",
+            icon_name="list-remove-symbolic",
+            sensitive=False,
+        )
+        self.remove_selected_btn.connect("clicked", self.on_remove_queue_item)
+
+        queue_buttons.append(self.clear_done_btn)
+        queue_buttons.append(self.remove_selected_btn)
+        queue_box.append(queue_buttons)
+
+        group.add(queue_box)
+        return group
+
     def _build_transcripts_section(self) -> Adw.PreferencesGroup:
         group = Adw.PreferencesGroup(title="Transcriptions")
+
+        # Barre de recherche
+        search_box = Gtk.Box(spacing=10, margin_bottom=10)
+        self.search_entry = Gtk.SearchEntry(
+            placeholder_text="Rechercher dans les transcriptions...",
+            hexpand=True,
+        )
+        self.search_entry.connect("search-changed", self.on_search_changed)
+        search_box.append(self.search_entry)
+        group.add(search_box)
 
         self.transcripts_list = Gtk.ListBox(
             selection_mode=Gtk.SelectionMode.SINGLE,
@@ -275,13 +473,28 @@ class VoxCastWindow:
             vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
             child=self.transcripts_list,
         )
-        scrolled.set_size_request(-1, 180)
+        scrolled.set_size_request(-1, 150)
 
         list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         list_box.append(scrolled)
 
-        # Boutons
         list_buttons = Gtk.Box(spacing=10, halign=Gtk.Align.END, margin_top=10)
+
+        self.export_srt_btn = Gtk.Button(
+            label="SRT",
+            icon_name="document-save-as-symbolic",
+            tooltip_text="Exporter la transcription sélectionnée en SRT",
+            sensitive=False,
+        )
+        self.export_srt_btn.connect("clicked", self.on_export_srt)
+
+        self.export_vtt_btn = Gtk.Button(
+            label="VTT",
+            icon_name="document-save-as-symbolic",
+            tooltip_text="Exporter la transcription sélectionnée en VTT",
+            sensitive=False,
+        )
+        self.export_vtt_btn.connect("clicked", self.on_export_vtt)
 
         self.open_btn = Gtk.Button(
             label="Ouvrir",
@@ -304,6 +517,8 @@ class VoxCastWindow:
         self.delete_btn.add_css_class("destructive-action")
         self.delete_btn.connect("clicked", self.on_delete_transcript_clicked)
 
+        list_buttons.append(self.export_srt_btn)
+        list_buttons.append(self.export_vtt_btn)
         list_buttons.append(self.open_btn)
         list_buttons.append(self.open_folder_btn)
         list_buttons.append(self.delete_btn)
@@ -315,7 +530,6 @@ class VoxCastWindow:
     def _build_status_section(self) -> Adw.PreferencesGroup:
         group = Adw.PreferencesGroup()
 
-        # Barre de progression
         self.progress_bar = Gtk.ProgressBar(
             halign=Gtk.Align.FILL,
             visible=False,
@@ -323,7 +537,6 @@ class VoxCastWindow:
         )
         group.add(self.progress_bar)
 
-        # Label de statut
         self.status_label = Gtk.Label(
             label="Prêt",
             halign=Gtk.Align.START,
@@ -332,7 +545,6 @@ class VoxCastWindow:
         self.status_label.add_css_class("title-4")
         group.add(self.status_label)
 
-        # Log
         self.log_buffer = Gtk.TextBuffer()
         log_view = Gtk.TextView(
             buffer=self.log_buffer,
@@ -346,7 +558,7 @@ class VoxCastWindow:
             margin_end=10,
         )
         log_view.add_css_class("monospace")
-        log_view.set_size_request(-1, 120)
+        log_view.set_size_request(-1, 100)
 
         log_scrolled = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER,
@@ -366,7 +578,8 @@ class VoxCastWindow:
         self.window.insert_action_group("win", accel_group)
 
         shortcuts = [
-            ("transcribe", ["<Control>Return"], self.on_transcribe_clicked),
+            ("add_queue", ["<Control>Return"], self.on_add_to_queue),
+            ("start", ["<Control>space"], self.on_start_queue),
             ("cancel", ["<Control>q"], self.on_cancel_clicked),
             ("refresh", ["<Control>r"], self.refresh_transcripts_list),
             ("open", ["<Control>o"], self.on_open_transcript_clicked),
@@ -375,182 +588,329 @@ class VoxCastWindow:
 
         for name, accels, callback in shortcuts:
             action = Gio.SimpleAction(name=name)
-            action.connect("activate", lambda _a, _p, cb=cb: cb())
+            action.connect("activate", lambda _a, _p, cb=callback: cb())
             accel_group.add_action(action)
             self.app.set_accels_for_action(f"win.{name}", accels)
 
     # ========================================================================
-    # PIPELINE DE TRANSCRIPTION
+    # ESTIMATION DU COÛT
     # ========================================================================
 
-    def on_transcribe_clicked(self, button=None):
-        url = self.url_entry.get_text().strip()
-        if not url:
-            self.log_message("Veuillez entrer une URL YouTube.")
+    def _show_cost_estimate(self, source: str, is_local: bool):
+        """Affiche une estimation du coût et de la durée."""
+        if not source:
+            self.cost_label.set_label("")
             return
+
+        try:
+            if is_local and Path(source).exists():
+                duration = vtt.get_audio_duration_seconds(Path(source))
+                cost = vtt.estimate_cost(duration)
+                self.cost_label.set_label(
+                    f"Durée: {vtt.format_timestamp(duration)} | "
+                    f"Coût estimé: ${cost:.2f}"
+                )
+            elif source.startswith("http"):
+                # Pour les URLs, on fetch les infos (avec cache)
+                info = vtt.get_video_info_cached(source)
+                duration = info.get("duration", 0)
+                cost = vtt.estimate_cost(duration)
+                self.cost_label.set_label(
+                    f"Durée: {vtt.format_timestamp(duration)} | "
+                    f"Coût estimé: ${cost:.2f}"
+                )
+            else:
+                self.cost_label.set_label("")
+        except Exception:
+            self.cost_label.set_label("")
+
+    # ========================================================================
+    # FILE D'ATTENTE
+    # ========================================================================
+
+    def on_browse_audio(self, button):
+        """Ouvre un dialogue de sélection de fichier audio."""
+        dialog = Gtk.FileChooserDialog(
+            title="Choisir un fichier audio",
+            transient_for=self.window,
+            action=Gtk.FileChooserAction.OPEN,
+            modal=True,
+        )
+        # Filtres audio
+        filt = Gtk.FileFilter(name="Fichiers audio")
+        for ext in ["mp3", "wav", "m4a", "webm", "ogg", "flac", "aac", "wma"]:
+            filt.add_pattern(f"*.{ext}")
+        dialog.add_filter(filt)
+        dialog.add_buttons("Annuler", Gtk.ResponseType.CANCEL, "Ouvrir", Gtk.ResponseType.ACCEPT)
+        dialog.connect("response", self._on_browse_audio_response)
+        dialog.present()
+
+    def _on_browse_audio_response(self, dialog, response_id):
+        if response_id == Gtk.ResponseType.ACCEPT:
+            selected = dialog.get_file()
+            if selected:
+                self.url_entry.set_text(selected.get_path())
+                self._check_source_type()
+        dialog.destroy()
+
+    def on_add_to_queue(self, button=None):
+        """Ajoute l'élément courant à la file d'attente."""
+        source = self.url_entry.get_text().strip()
+        if not source:
+            self.log_message("Veuillez entrer une URL ou un fichier.")
+            return
+
+        is_local = not source.startswith("http")
+
+        # Vérifier que le fichier existe si local
+        if is_local and not Path(source).exists():
+            self.log_message(f"Fichier introuvable: {source}", "red")
+            return
+
+        # Récupérer les options
+        lang_idx = self.lang_dropdown.get_selected()
+        language = LANGUAGES[lang_idx][0]
+        if language == "auto":
+            language = None
+
+        ts_idx = self.ts_dropdown.get_selected()
+        ts_value = TIMESTAMP_OPTIONS[ts_idx][0]
+        timestamp_granularities = [ts_value] if ts_value != "none" else None
+
+        # Parse segment
+        start = vtt.parse_timestamp_arg(self.start_entry.get_text().strip()) if self.start_entry.get_text().strip() else None
+        end = vtt.parse_timestamp_arg(self.end_entry.get_text().strip()) if self.end_entry.get_text().strip() else None
+
+        bias_text = self.bias_entry.get_text().strip()
+        context_bias = bias_text.split() if bias_text else None
+
+        options = {
+            "language": language,
+            "diarize": self.diarize_switch.get_active(),
+            "timestamp_granularities": timestamp_granularities,
+            "context_bias": context_bias,
+            "output_name": self.name_entry.get_text().strip() or None,
+            "keep_audio": self.keep_switch.get_active(),
+            "start": start,
+            "end": end,
+            "export_srt": self.srt_switch.get_active(),
+            "export_vtt": self.vtt_switch.get_active(),
+        }
+
+        item = QueueItem(source=source, is_local=is_local, options=options)
+        self.queue.append(item)
+        self._refresh_queue_list()
+
+        # Réinitialiser les champs
+        self.url_entry.set_text("")
+        self.name_entry.set_text("")
+        self.start_entry.set_text("")
+        self.end_entry.set_text("")
+        self.cost_label.set_label("")
+
+        self.log_message(f"Ajouté à la file: {source}")
+        self.start_btn.set_sensitive(len(self.queue) > 0)
+
+    def _refresh_queue_list(self):
+        """Met à jour visuellement la file d'attente."""
+        for row in list(self.queue_list):
+            self.queue_list.remove(row)
+
+        if not self.queue:
+            empty = Gtk.Label(
+                label="File vide",
+                halign=Gtk.Align.CENTER,
+                margin_top=8,
+                margin_bottom=8,
+            )
+            empty.add_css_class("dim-label")
+            self.queue_list.append(empty)
+            return
+
+        for i, item in enumerate(self.queue):
+            row = self._create_queue_row(item, i)
+            self.queue_list.append(row)
+
+        # Mettre à jour l'état du bouton start
+        pending = [q for q in self.queue if q.status == STATUS_PENDING]
+        self.start_btn.set_sensitive(len(pending) > 0 and not self.running)
+
+    def _create_queue_row(self, item: QueueItem, index: int) -> Gtk.Widget:
+        box = Gtk.Box(spacing=10, halign=Gtk.Align.FILL)
+
+        # Icône selon le type
+        icon_name = "audio-x-generic-symbolic" if item.is_local else "media-playlist-repeat-symbolic"
+        icon = Gtk.Image(icon_name=icon_name, pixel_size=20)
+
+        # Info
+        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        source_short = item.source if len(item.source) <= 60 else item.source[:57] + "..."
+        name_label = Gtk.Label(
+            label=source_short,
+            halign=Gtk.Align.START,
+            ellipsize=Pango.EllipsizeMode.END,
+            max_width_chars=50,
+        )
+        name_label.add_css_class("caption")
+
+        status_text = STATUS_LABELS.get(item.status, item.status)
+        status_label = Gtk.Label(
+            label=status_text,
+            halign=Gtk.Align.START,
+        )
+        css = STATUS_COLORS.get(item.status, "")
+        if css:
+            status_label.add_css_class(css)
+
+        info_box.append(name_label)
+        info_box.append(status_label)
+        item.status_label = status_label
+
+        box.append(icon)
+        box.append(info_box)
+        box.append(Gtk.Box())
+
+        row = Gtk.ListBoxRow(child=box, activatable=False)
+        item.row_widget = row
+        return row
+
+    def on_remove_queue_item(self, button=None):
+        """Retire l'élément sélectionné de la file."""
+        selected = self.queue_list.get_selected_row()
+        if selected is None:
+            return
+        idx = selected.get_index()
+        if 0 <= idx < len(self.queue):
+            item = self.queue[idx]
+            if item.status == STATUS_RUNNING:
+                self.log_message("Impossible de retirer un élément en cours.", "red")
+                return
+            self.queue.pop(idx)
+            self._refresh_queue_list()
+            self.start_btn.set_sensitive(len(self.queue) > 0)
+
+    def on_clear_done(self, button=None):
+        """Retire les éléments terminés, en erreur ou annulés."""
+        self.queue = [q for q in self.queue if q.status in (STATUS_PENDING, STATUS_RUNNING)]
+        self._refresh_queue_list()
+        self.start_btn.set_sensitive(len(self.queue) > 0)
+
+    def on_start_queue(self, button=None):
+        """Démarre le traitement de la file d'attente."""
         if self.running:
-            self.log_message("Une transcription est déjà en cours.")
             return
         if not self.api_key:
-            self.log_message("Aucune clé API Mistral configurée. Ouvrez les paramètres.", "red")
+            self.log_message("Aucune clé API Mistral. Ouvrez Paramètres.", "red")
             return
         if not vtt.check_ffmpeg():
-            self.log_message("ffmpeg requis. Installez-le (apt install ffmpeg).", "red")
+            self.log_message("ffmpeg requis. Installez-le.", "red")
+            return
+
+        pending = [q for q in self.queue if q.status == STATUS_PENDING]
+        if not pending:
+            self.log_message("Aucun élément en attente.")
             return
 
         self.running = True
         self.cancelled = False
-        self.transcribe_btn.set_sensitive(False)
+        self.start_btn.set_sensitive(False)
         self.cancel_btn.set_sensitive(True)
         self.progress_bar.set_visible(True)
         self.progress_bar.set_fraction(0.0)
-        self.update_status("Démarrage...", "yellow")
 
-        self.thread = threading.Thread(
-            target=self._run_pipeline,
-            args=(url,),
+        self.queue_thread = threading.Thread(
+            target=self._process_queue,
             daemon=True,
         )
-        self.thread.start()
+        self.queue_thread.start()
 
-    def _run_pipeline(self, url: str):
-        # Capturer stdout vers le log
+    def _process_queue(self):
+        """Traite la file d'attente séquentiellement."""
         old_stdout = sys.stdout
         log_stream = GlibLogStream(self.log_message)
         sys.stdout = log_stream
 
         try:
-            # --- ÉTAPE 1 : Téléchargement ---
-            GLib.idle_add(self.update_status, "Téléchargement audio...", "yellow")
-            GLib.idle_add(self.progress_bar.set_fraction, 0.05)
+            pending = [q for q in self.queue if q.status == STATUS_PENDING]
+            total = len(pending)
 
-            mp3_path, video_info = vtt.download_audio(url, vtt.TEMP_DIR)
-
-            if self.cancelled:
-                self._cleanup(mp3_path, [], False)
-                return
-
-            GLib.idle_add(self.progress_bar.set_fraction, 0.20)
-
-            # --- ÉTAPE 2a : Découpage si nécessaire ---
-            audio_duration = vtt.get_audio_duration_seconds(mp3_path)
-            needs_split = audio_duration > vtt.MAX_AUDIO_SECONDS
-
-            if needs_split:
-                GLib.idle_add(self.update_status, "Découpage audio...", "yellow")
-                chunks = vtt.split_audio(mp3_path, vtt.TEMP_DIR / "chunks")
+            for qi, item in enumerate(pending, 1):
                 if self.cancelled:
-                    self._cleanup(mp3_path, [c for c, _ in chunks], needs_split)
-                    return
-                audio_files = chunks
-            else:
-                audio_files = [(mp3_path, 0.0)]
+                    item.status = STATUS_CANCELLED
+                    GLib.idle_add(self._update_queue_item_status, item)
+                    continue
 
-            GLib.idle_add(self.progress_bar.set_fraction, 0.30)
+                item.status = STATUS_RUNNING
+                GLib.idle_add(self._update_queue_item_status, item)
 
-            # --- ÉTAPE 2b : Transcription ---
-            lang_idx = self.lang_dropdown.get_selected()
-            language = LANGUAGES[lang_idx][0]
-            if language == "auto":
-                language = None
+                GLib.idle_add(self.update_status,
+                    f"Traitement {qi}/{total}: {item.source[:40]}...", "yellow")
+                GLib.idle_add(self.log_message,
+                    f"--- [{qi}/{total}] {item.source} ---")
 
-            ts_idx = self.ts_dropdown.get_selected()
-            ts_value = TIMESTAMP_OPTIONS[ts_idx][0]
-            timestamp_granularities = [ts_value] if ts_value != "none" else None
+                opts = item.options
+                try:
+                    output_path = vtt.run_pipeline(
+                        source=item.source,
+                        api_key=self.api_key,
+                        language=opts.get("language"),
+                        diarize=opts.get("diarize", False),
+                        timestamp_granularities=opts.get("timestamp_granularities"),
+                        context_bias=opts.get("context_bias"),
+                        output_name=opts.get("output_name"),
+                        keep_audio=opts.get("keep_audio", False),
+                        start=opts.get("start"),
+                        end=opts.get("end"),
+                        is_local_file=item.is_local,
+                        transcripts_dir=self.transcripts_dir,
+                        export_srt_file=opts.get("export_srt", False),
+                        export_vtt_file=opts.get("export_vtt", False),
+                        progress_callback=lambda f: GLib.idle_add(self.progress_bar.set_fraction, f),
+                        log_callback=lambda msg: GLib.idle_add(self.log_message, msg),
+                        cancel_check=lambda: self.cancelled,
+                    )
+                    item.status = STATUS_DONE
+                    item.output_path = output_path
+                    GLib.idle_add(self.log_message,
+                        f"Terminé: {output_path.name}", "green")
 
-            diarize = self.diarize_switch.get_active()
-            keep_audio = self.keep_switch.get_active()
-            bias_text = self.bias_entry.get_text().strip()
-            context_bias = bias_text.split() if bias_text else None
+                except InterruptedError:
+                    item.status = STATUS_CANCELLED
+                    GLib.idle_add(self.log_message, "Annulé", "yellow")
+                except Exception as e:
+                    item.status = STATUS_ERROR
+                    item.error = str(e)
+                    GLib.idle_add(self.log_message, f"Erreur: {e}", "red")
 
-            results = []
-            total = len(audio_files)
+                GLib.idle_add(self._update_queue_item_status, item)
 
-            for i, (chunk_path, offset) in enumerate(audio_files, 1):
-                if self.cancelled:
-                    self._cleanup(mp3_path, [c for c, _ in audio_files], needs_split)
-                    return
-
-                if total > 1:
-                    GLib.idle_add(self.update_status, f"Transcription chunk {i}/{total}...", "yellow")
-
-                result = vtt.transcribe_audio(
-                    mp3_path=chunk_path,
-                    api_key=self.api_key,
-                    language=language,
-                    diarize=diarize,
-                    timestamp_granularities=timestamp_granularities,
-                    context_bias=context_bias,
-                )
-                results.append((result, offset))
-
-                text = result.get("text", "")
-                GLib.idle_add(self.log_message, f"Chunk {i}/{total} transcrit: {len(text)} caractères")
-
-                # Progression : 30% -> 90% répartis sur les chunks
-                progress = 0.30 + 0.60 * (i / total)
-                GLib.idle_add(self.progress_bar.set_fraction, progress)
-
-            # --- ÉTAPE 3 : Sauvegarde ---
-            GLib.idle_add(self.update_status, "Sauvegarde...", "yellow")
-            GLib.idle_add(self.progress_bar.set_fraction, 0.95)
-
-            custom_name = self.name_entry.get_text().strip()
-            output_name = vtt.sanitize_filename(custom_name) if custom_name else vtt.sanitize_filename(video_info.get("title", "transcription"))
-            output_path = self.transcripts_dir / f"{output_name}.md"
-
-            vtt.save_transcription(
-                results=results,
-                video_info=video_info,
-                output_path=output_path,
-                audio_name=mp3_path.name,
-                diarize=diarize,
-                timestamp_granularities=timestamp_granularities,
-            )
-
-            GLib.idle_add(self.progress_bar.set_fraction, 1.0)
-            GLib.idle_add(self.update_status, "Transcription terminée", "green")
-            GLib.idle_add(self.log_message, f"Fichier: {output_path}", "green")
-
-            # Aperçu
-            full_text = " ".join(r.get("text", "") for r, _ in results)
-            preview = full_text[:200] + ("..." if len(full_text) > 200 else "")
-            GLib.idle_add(self.log_message, f"Aperçu: {preview}")
-
-            # Nettoyage
-            self._cleanup(mp3_path, [c for c, _ in audio_files], needs_split, keep_audio)
+            GLib.idle_add(self.update_status, "File terminée", "green")
 
         except Exception as e:
-            import traceback
-            GLib.idle_add(self.log_message, f"Erreur: {e}", "red")
-            GLib.idle_add(self.log_message, traceback.format_exc(), "red")
+            GLib.idle_add(self.log_message, f"Erreur fatale: {e}", "red")
             GLib.idle_add(self.update_status, "Erreur", "red")
         finally:
             sys.stdout = old_stdout
             log_stream.flush()
-            GLib.idle_add(self._on_pipeline_done)
+            GLib.idle_add(self._on_queue_done)
 
-    def _cleanup(self, mp3_path, chunk_paths, needs_split, keep_audio=False):
-        if not keep_audio:
-            mp3_path.unlink(missing_ok=True)
-            if needs_split:
-                for c in chunk_paths:
-                    c.unlink(missing_ok=True)
-                try:
-                    (vtt.TEMP_DIR / "chunks").rmdir()
-                except OSError:
-                    pass
-                try:
-                    vtt.TEMP_DIR.rmdir()
-                except OSError:
-                    pass
+    def _update_queue_item_status(self, item: QueueItem):
+        """Met à jour le label de statut d'un item de la file."""
+        if item.status_label:
+            item.status_label.set_label(STATUS_LABELS.get(item.status, item.status))
+            # Mettre à jour la couleur
+            for css in STATUS_COLORS.values():
+                item.status_label.remove_css_class(css)
+            css = STATUS_COLORS.get(item.status, "")
+            if css:
+                item.status_label.add_css_class(css)
 
-    def _on_pipeline_done(self):
+    def _on_queue_done(self):
         self.running = False
         self.cancelled = False
-        self.transcribe_btn.set_sensitive(True)
         self.cancel_btn.set_sensitive(False)
         self.progress_bar.set_visible(False)
+        self._refresh_queue_list()
         self.refresh_transcripts_list()
 
     def on_cancel_clicked(self, button=None):
@@ -560,38 +920,65 @@ class VoxCastWindow:
             self.update_status("Annulation en cours...", "yellow")
 
     # ========================================================================
-    # LISTE DES TRANSCRIPTIONS
+    # LISTE DES TRANSCRIPTIONS + RECHERCHE
     # ========================================================================
 
     def refresh_transcripts_list(self, button=None):
-        transcripts = self._get_transcripts()
+        self.all_transcripts = self._get_transcripts()
+        self._filter_transcripts(self.search_entry.get_text())
 
+    def on_search_changed(self, entry):
+        self._filter_transcripts(entry.get_text())
+
+    def _filter_transcripts(self, query: str):
+        """Filtre la liste par nom ou par contenu."""
         for row in list(self.transcripts_list):
             self.transcripts_list.remove(row)
 
+        if not query:
+            transcripts = self.all_transcripts
+        else:
+            query_lower = query.lower()
+            transcripts = []
+            for t in self.all_transcripts:
+                # Recherche par nom
+                if query_lower in t["name"].lower():
+                    transcripts.append(t)
+                    continue
+                # Recherche par contenu
+                try:
+                    content = t["path"].read_text(encoding="utf-8").lower()
+                    if query_lower in content:
+                        transcripts.append(t)
+                except Exception:
+                    continue
+
         if not transcripts:
+            label = "Aucune transcription" if not query else "Aucun résultat"
             empty = Gtk.Label(
-                label="Aucune transcription",
+                label=label,
                 halign=Gtk.Align.CENTER,
-                margin_top=15,
-                margin_bottom=15,
+                margin_top=10,
+                margin_bottom=10,
             )
             empty.add_css_class("dim-label")
             self.transcripts_list.append(empty)
-            self.update_status("Prêt", None)
+            self.open_btn.set_sensitive(False)
+            self.delete_btn.set_sensitive(False)
+            self.export_srt_btn.set_sensitive(False)
+            self.export_vtt_btn.set_sensitive(False)
             return
 
         for t in transcripts:
             row = self._create_transcript_row(t)
             self.transcripts_list.append(row)
 
-        self.update_status(f"{len(transcripts)} transcription(s)", None)
-
     def _get_transcripts(self) -> list[dict]:
         transcripts = []
         if not self.transcripts_dir.exists():
             return transcripts
-        for f in sorted(self.transcripts_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
+        for f in sorted(self.transcripts_dir.glob("*.md"),
+                        key=lambda p: p.stat().st_mtime, reverse=True):
             stat = f.stat()
             transcripts.append({
                 "name": f.stem,
@@ -635,14 +1022,144 @@ class VoxCastWindow:
         if row is None:
             self.open_btn.set_sensitive(False)
             self.delete_btn.set_sensitive(False)
+            self.export_srt_btn.set_sensitive(False)
+            self.export_vtt_btn.set_sensitive(False)
             self.selected_transcript = None
             return
+
+        # Retrouver la transcription correspondante
         idx = row.get_index()
-        transcripts = self._get_transcripts()
+        query = self.search_entry.get_text()
+        if not query:
+            transcripts = self.all_transcripts
+        else:
+            query_lower = query.lower()
+            transcripts = []
+            for t in self.all_transcripts:
+                if query_lower in t["name"].lower():
+                    transcripts.append(t)
+                    continue
+                try:
+                    content = t["path"].read_text(encoding="utf-8").lower()
+                    if query_lower in content:
+                        transcripts.append(t)
+                except Exception:
+                    continue
+
         if 0 <= idx < len(transcripts):
             self.selected_transcript = transcripts[idx]
             self.open_btn.set_sensitive(True)
             self.delete_btn.set_sensitive(True)
+            self.export_srt_btn.set_sensitive(True)
+            self.export_vtt_btn.set_sensitive(True)
+
+    # ========================================================================
+    # EXPORT SRT/VTT DEPUIS UNE TRANSCRIPTION EXISTANTE
+    # ========================================================================
+
+    def on_export_srt(self, button=None):
+        if not self.selected_transcript:
+            return
+        self._export_subtitle("srt")
+
+    def on_export_vtt(self, button=None):
+        if not self.selected_transcript:
+            return
+        self._export_subtitle("vtt")
+
+    def _export_subtitle(self, fmt: str):
+        """Parse un .md de transcription et exporte en SRT ou VTT."""
+        path = self.selected_transcript["path"]
+        content = path.read_text(encoding="utf-8")
+
+        # Parser les segments [HH:MM:SS - HH:MM:SS] ou [HH:MM:SS] **Speaker**:
+        import re
+        entries = []
+        idx = 1
+
+        # Pattern: [timestamp] ou [start - end]
+        seg_pattern = re.compile(
+            r'\[(\d{2}:\d{2}:\d{2})(?:\s*-\s*(\d{2}:\d{2}:\d{2}))?\]'
+        )
+        speaker_pattern = re.compile(r'\*\*(.+?)\*\*:?')
+
+        lines = content.split("\n")
+        current_ts = None
+        current_end = None
+        current_speaker = None
+        current_text = []
+
+        for line in lines:
+            ts_match = seg_pattern.match(line)
+            if ts_match:
+                # Sauvegarder le segment précédent
+                if current_ts is not None and current_text:
+                    text = " ".join(current_text).strip()
+                    if text:
+                        entries.append((idx, current_ts, current_end or current_ts,
+                                        f"{current_speaker + ': ' if current_speaker else ''}{text}"))
+                        idx += 1
+                current_ts = ts_match.group(1)
+                current_end = ts_match.group(2)
+                spk_match = speaker_pattern.search(line)
+                current_speaker = spk_match.group(1) if spk_match else None
+                current_text = []
+            elif current_ts is not None and line.strip() and not line.startswith("---") and not line.startswith("##"):
+                current_text.append(line.strip())
+            elif current_ts is not None and not line.strip() and current_text:
+                text = " ".join(current_text).strip()
+                if text:
+                    entries.append((idx, current_ts, current_end or current_ts,
+                                    f"{current_speaker + ': ' if current_speaker else ''}{text}"))
+                    idx += 1
+                current_text = []
+                current_ts = None
+                current_end = None
+                current_speaker = None
+
+        # Dernier segment
+        if current_ts is not None and current_text:
+            text = " ".join(current_text).strip()
+            if text:
+                entries.append((idx, current_ts, current_end or current_ts,
+                                f"{current_speaker + ': ' if current_speaker else ''}{text}"))
+
+        if not entries:
+            self.log_message("Aucun segment avec timestamps trouvé dans la transcription.", "red")
+            return
+
+        # Convertir timestamps string -> secondes
+        def ts_to_secs(ts: str) -> float:
+            parts = ts.split(":")
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+
+        # Écrire le fichier
+        out_path = path.with_suffix(f".{fmt}")
+        out_lines = []
+
+        if fmt == "vtt":
+            out_lines.append("WEBVTT")
+            out_lines.append("")
+
+        for idx, start_ts, end_ts, text in entries:
+            start_s = ts_to_secs(start_ts)
+            end_s = ts_to_secs(end_ts)
+
+            if fmt == "srt":
+                out_lines.append(str(idx))
+                out_lines.append(f"{vtt._format_srt_timestamp(start_s)} --> {vtt._format_srt_timestamp(end_s)}")
+            else:
+                out_lines.append(f"{vtt._format_vtt_timestamp(start_s)} --> {vtt._format_vtt_timestamp(end_s)}")
+
+            out_lines.append(text)
+            out_lines.append("")
+
+        out_path.write_text("\n".join(out_lines), encoding="utf-8")
+        self.log_message(f"Exporté: {out_path.name} ({len(entries)} segments)", "green")
+
+    # ========================================================================
+    # ACTIONS TRANSCRIPTIONS
+    # ========================================================================
 
     def on_open_transcript_clicked(self, button=None):
         if not self.selected_transcript:
@@ -661,7 +1178,6 @@ class VoxCastWindow:
     def on_delete_transcript_clicked(self, button=None):
         if not self.selected_transcript:
             return
-
         name = self.selected_transcript["name"]
         path = self.selected_transcript["path"]
 
@@ -746,12 +1262,12 @@ class VoxCastWindow:
         dialog.destroy()
 
     # ========================================================================
-    # URL
+    # URL CHANGED
     # ========================================================================
 
     def on_url_changed(self, entry):
         url = entry.get_text().strip()
-        self.transcribe_btn.set_sensitive(bool(url) and not self.running)
+        self.add_queue_btn.set_sensitive(bool(url) and not self.running)
 
     # ========================================================================
     # UTILITAIRES
@@ -768,8 +1284,7 @@ class VoxCastWindow:
             color_map = {"red": "red", "green": "green", "yellow": "orange"}
             tag = self.log_buffer.create_tag(None, foreground=color_map.get(color, color))
             start = self.log_buffer.get_iter_at_offset(
-                self.log_buffer.get_char_count() - len(full)
-            )
+                self.log_buffer.get_char_count() - len(full))
             self.log_buffer.apply_tag(tag, start, end_iter)
 
         self.log_buffer.place_cursor(end_iter)
@@ -813,8 +1328,8 @@ class VoxCastWindow:
 
     def on_shutdown(self, app):
         self.cancelled = True
-        if self.thread:
-            self.thread.join(timeout=3)
+        if self.queue_thread:
+            self.queue_thread.join(timeout=3)
 
     def run(self):
         return self.app.run()
