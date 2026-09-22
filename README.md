@@ -17,18 +17,39 @@ Le fichier de sortie est structuré pour être directement exploitable par un ou
 - **Diarisation** optionnelle (identification des speakers)
 - **Timestamps** optionnels (par segment ou par mot)
 - **Context biasing** (jusqu'à 100 termes pour guider la transcription de noms propres)
-- Détection automatique de la langue ou forçage manuel
+- Détection automatique de la langue ou forçage manuel (13 langues)
 - **Découpage automatique** des vidéos longues (>3h) en chunks, transcription séparée puis fusion en un seul fichier
+- **Découpage parallèle** des chunks via ffmpeg multi-threaded (tous les coeurs CPU)
 - Sortie en Markdown structuré avec métadonnées
 - Nettoyage automatique du fichier audio temporaire
+- **Interface graphique GTK4 + Libadwaita** (style GNOME natif)
+- **CLI** pour automatisation et scripts
 
 ## Prérequis
 
 - Python 3.8+
 - `ffmpeg` installé sur le système
+- **GTK4 et Libadwaita** (pour l'interface graphique)
 - Une clé API Mistral ([console.mistral.ai](https://console.mistral.ai))
 
 ## Installation
+
+1. Installer les dépendances système pour GTK4 :
+
+   - **Ubuntu/Debian** :
+     ```bash
+     sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-libadwaita-1.0 ffmpeg
+     ```
+   - **Fedora** :
+     ```bash
+     sudo dnf install python3-gobject gtk4 libadwaita ffmpeg
+     ```
+   - **Arch Linux** :
+     ```bash
+     sudo pacman -S python-gobject gtk4 libadwaita ffmpeg
+     ```
+
+2. Installer les dépendances Python :
 
 ```bash
 cd VoxCast
@@ -38,13 +59,38 @@ python3 -m venv venv
 
 ## Configuration
 
-Définissez votre clé API Mistral :
+Définissez votre clé API Mistral (CLI) :
 
 ```bash
 export MISTRAL_API_KEY="votre-cle"
 ```
 
+Ou saisissez-la dans l'interface graphique via Paramètres > Clé API.
+
 ## Utilisation
+
+### Interface graphique (recommandée)
+
+```bash
+./venv/bin/python3 main.py
+```
+
+L'interface permet de :
+- Coller une URL YouTube et lancer la transcription
+- Choisir la langue, les timestamps, la diarisation, le context bias
+- Suivre la progression en temps réel (téléchargement → découpage → transcription → sauvegarde)
+- Consulter le log détaillé
+- Ouvrir, supprimer les transcriptions depuis la liste
+- Configurer la clé API et le dossier de sortie
+
+**Raccourcis clavier :**
+- `Ctrl+Entrée` : Lancer la transcription
+- `Ctrl+Q` : Annuler
+- `Ctrl+R` : Rafraîchir la liste
+- `Ctrl+O` : Ouvrir la transcription sélectionnée
+- `Ctrl+D` : Supprimer la transcription sélectionnée
+
+### En ligne de commande (CLI)
 
 ```bash
 # Basique
@@ -65,7 +111,7 @@ export MISTRAL_API_KEY="votre-cle"
 
 Les transcriptions sont sauvegardées dans `transcripts/` au format Markdown.
 
-## Options
+## Options CLI
 
 | Option | Description |
 |---|---|
@@ -83,9 +129,11 @@ Note : `--timestamps` et `--language` ne sont pas compatibles simultanément (li
 
 ```
 VoxCast/
-├── video_to_text.py    # Script principal (CLI)
-├── requirements.txt    # Dépendances (yt-dlp, mistralai)
-├── README.md
+├── main.py              # Point d'entrée GUI (GTK4)
+├── window.py            # Interface graphique (GTK4 + Libadwaita)
+├── video_to_text.py     # Logique principale (CLI + pipeline)
+├── requirements.txt     # Dépendances (yt-dlp, mistralai, PyGObject)
+├── settings.json        # Paramètres utilisateur (généré)
 ├── downloads/           # MP3 temporaires (auto-nettoyés)
 └── transcripts/         # Transcriptions .md de sortie
 ```
