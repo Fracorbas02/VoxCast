@@ -173,6 +173,8 @@ class VoxCastWindow:
         main_box.set_margin_bottom(20)
         main_box.set_margin_start(20)
         main_box.set_margin_end(20)
+        main_box.set_halign(Gtk.Align.CENTER)
+        main_box.set_size_request(700, -1)  # Largeur min, pas de hauteur min
 
         main_box.append(self._build_source_section())
         main_box.append(self._build_options_section())
@@ -180,7 +182,15 @@ class VoxCastWindow:
         main_box.append(self._build_transcripts_section())
         main_box.append(self._build_status_section())
 
-        self.window.set_child(main_box)
+        # Wrapper dans un ScrolledWindow pour le redimensionnement
+        scrolled = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            child=main_box,
+        )
+        scrolled.set_vexpand(True)
+
+        self.window.set_child(scrolled)
 
         self.setup_accelerators()
         self.refresh_transcripts_list()
