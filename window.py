@@ -5,11 +5,11 @@ Interface moderne avec GTK4 + Libadwaita pour une intégration native sous GNOME
 """
 
 import json
+import logging
 import os
 import subprocess
 import sys
 import threading
-import io
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -30,7 +30,18 @@ import video_to_text as vtt
 APP_ID = "com.voxcast.app"
 APP_DIR = Path(__file__).parent
 DEFAULT_TRANSCRIPTS_DIR = APP_DIR / "transcripts"
+LOG_FILE = APP_DIR / "voxccast.log"
 VERSION = "1.1.0"
+
+# Les logs vont dans le shell d'où l'app est lancée + dans voxcast.log.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
 
 LANGUAGES = [
     ("auto", "Auto-détection"),
@@ -76,46 +87,6 @@ STATUS_COLORS = {
     STATUS_ERROR: "error",
     STATUS_CANCELLED: "dim-label",
 }
-
-
-# ============================================================================
-# CAPTURE DE STDOUT POUR LE LOG
-# ============================================================================
-
-class GlibLogStream(io.TextIOBase):
-    """Redirige les prints vers le log panel de l'UI (thread-safe)."""
-    def __init__(self, callback):
-        self.callback = callback
-        self._buf = ""
-
-    def write(self, text):
-        self._buf += text
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            if line.strip():
-                GLib.idle_add(self.callback, line)
-        return len(text)
-
-    def flush(self):
-        if self._buf.strip():
-            GLib.idle_add(self.callback, self._buf)
-            self._buf = ""
-
-    # Ces propriétés sont nécessaires car io.TextIOBase les attend
-    @property
-    def encoding(self):
-        return "utf-8"
-
-    @property
-    def writable(self):
-        return True
-
-    @property
-    def readable(self):
-        return False
-
-    def fileno(self):
-        raise OSError("GlibLogStream n'a pas de file descriptor")
 
 
 # ============================================================================
@@ -206,7 +177,9 @@ class VoxCastWindow:
         )
         scrolled.set_vexpand(True)
 
-        self.window.set_child(scrolled)
+        # Toasts pour les retours utilisateur (succès, erreurs, annulations)
+        self.toast_overlay = Adw.ToastOverlay(child=scrolled)
+        self.window.set_child(self.toast_overlay)
 
         self.setup_accelerators()
         self.refresh_transcripts_list()
@@ -579,28 +552,6 @@ class VoxCastWindow:
         self.status_label.add_css_class("title-4")
         group.add(self.status_label)
 
-        self.log_buffer = Gtk.TextBuffer()
-        log_view = Gtk.TextView(
-            buffer=self.log_buffer,
-            editable=False,
-            cursor_visible=False,
-            wrap_mode=Gtk.WrapMode.WORD,
-            monospace=True,
-            margin_top=10,
-            margin_bottom=10,
-            margin_start=10,
-            margin_end=10,
-        )
-        log_view.add_css_class("monospace")
-        log_view.set_size_request(-1, 100)
-
-        log_scrolled = Gtk.ScrolledWindow(
-            hscrollbar_policy=Gtk.PolicyType.NEVER,
-            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
-            child=log_view,
-        )
-        group.add(log_scrolled)
-
         return group
 
     # ========================================================================
@@ -701,14 +652,14 @@ class VoxCastWindow:
         """Ajoute l'élément courant à la file d'attente."""
         source = self.url_entry.get_text().strip()
         if not source:
-            self.log_message("Veuillez entrer une URL ou un fichier.")
+            self.toast("Veuillez entrer une URL ou un fichier.")
             return
 
         is_local = not source.startswith("http")
 
         # Vérifier que le fichier existe si local
         if is_local and not Path(source).exists():
-            self.log_message(f"Fichier introuvable: {source}", "red")
+            self.toast(f"Fichier introuvable : {source}", "error")
             return
 
         # Récupérer les options
@@ -752,7 +703,7 @@ class VoxCastWindow:
         self.end_entry.set_text("")
         self.cost_label.set_label("")
 
-        self.log_message(f"Ajouté à la file: {source}")
+        self.toast(f"Ajouté à la file : {Path(source).name}")
         self.start_btn.set_sensitive(len(self.queue) > 0)
 
     def _refresh_queue_list(self):
@@ -827,7 +778,7 @@ class VoxCastWindow:
         if 0 <= idx < len(self.queue):
             item = self.queue[idx]
             if item.status == STATUS_RUNNING:
-                self.log_message("Impossible de retirer un élément en cours.", "red")
+                self.toast("Impossible de retirer un élément en cours.", "error")
                 return
             self.queue.pop(idx)
             self._refresh_queue_list()
@@ -846,19 +797,19 @@ class VoxCastWindow:
                 item.status = STATUS_PENDING
                 item.error = None
         self._refresh_queue_list()
-        self.log_message("Éléments remis en file d'attente.")
+        self.toast("Éléments en erreur remis en attente.")
 
     def on_start_queue(self, button=None):
         """Démarre le traitement de la file d'attente."""
         if self.running:
             return
         if not vtt.check_ffmpeg():
-            self.log_message("ffmpeg requis. Installez-le.", "red")
+            self.toast("ffmpeg requis. Installez-le (apt install ffmpeg).", "error")
             return
 
         pending = [q for q in self.queue if q.status == STATUS_PENDING]
         if not pending:
-            self.log_message("Aucun élément en attente.")
+            self.toast("Aucun élément en attente.")
             return
 
         self._ensure_api_key(self._start_queue_actual)
@@ -883,11 +834,8 @@ class VoxCastWindow:
         self.queue_thread.start()
 
     def _process_queue(self):
-        """Traite la file d'attente séquentiellement."""
-        old_stdout = sys.stdout
-        log_stream = GlibLogStream(self.log_message)
-        sys.stdout = log_stream
-
+        """Traite la file d'attente séquentiellement.
+        Les logs du pipeline vont dans le shell + voxcast.log via logging."""
         try:
             pending = [q for q in self.queue if q.status == STATUS_PENDING]
             total = len(pending)
@@ -903,8 +851,7 @@ class VoxCastWindow:
 
                 GLib.idle_add(self.update_status,
                     f"Traitement {qi}/{total}: {item.source[:40]}...", "yellow")
-                GLib.idle_add(self.log_message,
-                    f"--- [{qi}/{total}] {item.source} ---")
+                self.log_message(f"--- [{qi}/{total}] {item.source} ---")
 
                 opts = item.options
                 try:
@@ -924,32 +871,32 @@ class VoxCastWindow:
                         export_srt_file=opts.get("export_srt", False),
                         export_vtt_file=opts.get("export_vtt", False),
                         progress_callback=lambda f: GLib.idle_add(self.progress_bar.set_fraction, f),
-                        log_callback=lambda msg: GLib.idle_add(self.log_message, msg),
                         cancel_check=lambda: self.cancelled,
                     )
                     item.status = STATUS_DONE
                     item.output_path = output_path
-                    GLib.idle_add(self.log_message,
-                        f"Terminé: {output_path.name}", "green")
+                    GLib.idle_add(self.toast, f"Transcription terminée : {output_path.name}",
+                        "success")
+                    self.log_message(f"Terminé: {output_path.name}")
 
                 except InterruptedError:
                     item.status = STATUS_CANCELLED
-                    GLib.idle_add(self.log_message, "Annulé", "yellow")
+                    GLib.idle_add(self.toast, "Transcription annulée", "info")
+                    self.log_message("Annulé")
                 except Exception as e:
                     item.status = STATUS_ERROR
                     item.error = str(e)
-                    GLib.idle_add(self.log_message, f"Erreur: {e}", "red")
+                    GLib.idle_add(self.toast, f"Erreur : {e}", "error", 6)
+                    self.log_message(f"Erreur: {e}")
 
                 GLib.idle_add(self._update_queue_item_status, item)
 
             GLib.idle_add(self.update_status, "File terminée", "green")
 
         except Exception as e:
-            GLib.idle_add(self.log_message, f"Erreur fatale: {e}", "red")
+            self.log_message(f"Erreur fatale: {e}")
             GLib.idle_add(self.update_status, "Erreur", "red")
         finally:
-            sys.stdout = old_stdout
-            log_stream.flush()
             GLib.idle_add(self._on_queue_done)
 
     def _update_queue_item_status(self, item: QueueItem):
@@ -1183,7 +1130,7 @@ class VoxCastWindow:
                                 f"{current_speaker + ': ' if current_speaker else ''}{text}"))
 
         if not entries:
-            self.log_message("Aucun segment avec timestamps trouvé dans la transcription.", "red")
+            self.toast("Aucun segment avec timestamps trouvé dans la transcription.", "error", 6)
             return
 
         # Convertir timestamps string -> secondes
@@ -1213,7 +1160,7 @@ class VoxCastWindow:
             out_lines.append("")
 
         out_path.write_text("\n".join(out_lines), encoding="utf-8")
-        self.log_message(f"Exporté: {out_path.name} ({len(entries)} segments)", "green")
+        self.toast(f"Exporté : {out_path.name} ({len(entries)} segments)", "success")
 
     # ========================================================================
     # ACTIONS TRANSCRIPTIONS
@@ -1225,13 +1172,13 @@ class VoxCastWindow:
         try:
             subprocess.run(["xdg-open", str(self.selected_transcript["path"])], check=True)
         except Exception as e:
-            self.log_message(f"Impossible d'ouvrir: {e}", "red")
+            self.toast(f"Impossible d'ouvrir : {e}", "error")
 
     def on_open_folder_clicked(self, button=None):
         try:
             subprocess.run(["xdg-open", str(self.transcripts_dir)], check=True)
         except Exception as e:
-            self.log_message(f"Impossible d'ouvrir: {e}", "red")
+            self.toast(f"Impossible d'ouvrir : {e}", "error")
 
     def on_delete_transcript_clicked(self, button=None):
         if not self.selected_transcript:
@@ -1255,10 +1202,10 @@ class VoxCastWindow:
         if response == "delete":
             try:
                 path.unlink()
-                self.log_message(f"Supprimé: {path.stem}")
+                self.toast(f"Supprimé : {path.stem}")
                 self.refresh_transcripts_list()
             except Exception as e:
-                self.log_message(f"Erreur: {e}", "red")
+                self.toast(f"Erreur : {e}", "error")
         dialog.destroy()
 
     # ========================================================================
@@ -1368,7 +1315,7 @@ class VoxCastWindow:
                 if key:
                     self.api_key = key
                     self.save_settings()
-                    self.log_message("Clé API enregistrée.", "green")
+                    self.toast("Clé API enregistrée.", "success")
                     on_success()
             d.destroy()
 
@@ -1381,20 +1328,16 @@ class VoxCastWindow:
     # ========================================================================
 
     def log_message(self, message: str, color: str = None):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        full = f"[{timestamp}] {message}\n"
+        """Écrit un message dans le shell + voxcast.log (plus de console dans l'UI)."""
+        level_map = {"red": logging.ERROR, "yellow": logging.WARNING}
+        logging.log(level_map.get(color, logging.INFO), message)
 
-        end_iter = self.log_buffer.get_end_iter()
-        self.log_buffer.insert(end_iter, full)
-
-        if color:
-            color_map = {"red": "red", "green": "green", "yellow": "orange"}
-            tag = self.log_buffer.create_tag(None, foreground=color_map.get(color, color))
-            start = self.log_buffer.get_iter_at_offset(
-                self.log_buffer.get_char_count() - len(full))
-            self.log_buffer.apply_tag(tag, start, end_iter)
-
-        self.log_buffer.place_cursor(end_iter)
+    def toast(self, message: str, kind: str = "info", timeout: int = 4):
+        """Affiche un retour utilisateur non bloquant sous forme de toast."""
+        toast = Adw.Toast(title=message, timeout=timeout)
+        if kind == "error":
+            toast.add_css_class("error")
+        self.toast_overlay.add_toast(toast)
 
     def update_status(self, status: str, color: str = None):
         self.status_label.set_label(status)

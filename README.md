@@ -92,10 +92,13 @@ L'interface permet de :
 - Spécifier un segment précis (transcription partielle)
 - Ajouter plusieurs sources à la **file d'attente**
 - Démarrer/annuler le traitement de la file
-- Suivre la progression en temps réel
+- Suivre la progression en temps réel (téléchargement, transcription, estimation du temps restant)
+- Recevoir les retours (succès, erreurs, annulations) via des toasts GNOME
 - **Rechercher** dans les transcriptions par nom ou par contenu
 - Ouvrir, supprimer, exporter en SRT/VTT les transcriptions
 - Configurer la clé API et le dossier de sortie
+
+Les messages techniques du pipeline (yt-dlp, ffmpeg, API Mistral) ne sont plus affichés dans l'interface : ils vont dans le shell d'où l'application est lancée et dans le fichier `voxccast.log`.
 
 **Raccourcis clavier :**
 - `Ctrl+Entrée` : Ajouter à la file
@@ -168,6 +171,7 @@ VoxCast/
 ├── requirements.txt     # Dépendances (yt-dlp, mistralai, PyGObject)
 ├── settings.json        # Paramètres utilisateur (généré)
 ├── .cache.json          # Cache des métadonnées YouTube (généré)
+├── voxcast.log          # Journal de l'application (généré)
 ├── downloads/           # MP3 temporaires (auto-nettoyés)
 └── transcripts/         # Transcriptions .md, .srt, .vtt de sortie
 ```
