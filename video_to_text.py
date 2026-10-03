@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -44,9 +45,123 @@ COST_PER_MIN = 0.003
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # secondes
 
+# Facteur de vitesse initial : secondes de transcription par seconde d'affilée
+# d'audio. Ajusté dynamiquement à chaque chunk transcrit.
+TRANSCRIBE_SPEED_DEFAULT = 0.15
+
 OUTPUT_DIR = Path(__file__).parent / "transcripts"
 TEMP_DIR = Path(__file__).parent / "downloads"
 CACHE_FILE = Path(__file__).parent / ".cache.json"
+
+
+# ---------------------------------------------------------------------------
+# Progression
+# ---------------------------------------------------------------------------
+
+class ProgressReporter:
+    """
+    Anime la progression d'un pipeline entre les jalons réels.
+
+    Les jalons réels (octets téléchargés, ffmpeg, chunks transcrits) fixent
+    un plancher. Entre deux jalons (ex. pendant une requête API), un ticker
+    fait avancer la fraction lentement vers un plafond laissé volontairement
+    sous la cible (marge) : la barre bouge pour montrer l'activité mais
+    n'atteint jamais 100% avant la fin réelle.
+    """
+
+    def __init__(self, callback=None):
+        # callback(fraction: float, message: str)
+        self._callback = callback
+        self._frac = 0.0
+        self._ceiling = 1.0
+        self._rate = 0.0
+        self._message = ""
+        self._stop = threading.Event()
+        self._thread = None
+
+    def set(self, frac: Optional[float] = None, ceiling: Optional[float] = None,
+            rate: Optional[float] = None, message: Optional[str] = None):
+        """Met à jour jalons/plafond/message et émet immédiatement."""
+        if frac is not None:
+            self._frac = max(self._frac, frac)
+        if ceiling is not None:
+            # Affectation directe : chaque phase définit son propre plafond.
+            self._ceiling = max(ceiling, self._frac)
+        if rate is not None:
+            self._rate = rate
+        if message is not None:
+            self._message = message
+        self._emit()
+
+    def start_ticker(self):
+        """Démarre l'avancement progressif (1 tick/seconde)."""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+
+        def _tick():
+            while not self._stop.wait(1.0):
+                if self._rate > 0 and self._frac < self._ceiling:
+                    self._frac = min(self._frac + self._rate, self._ceiling)
+                    self._emit()
+
+        self._thread = threading.Thread(target=_tick, daemon=True)
+        self._thread.start()
+
+    def stop_ticker(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+            self._thread = None
+
+    def _emit(self):
+        if self._callback:
+            try:
+                self._callback(self._frac, self._message)
+            except Exception:
+                pass
+
+
+def fmt_duration(seconds: float) -> str:
+    """Formate une durée pour un humain : '1 min 20 s', '2 h 05 min'..."""
+    seconds = max(int(seconds), 0)
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min {seconds % 60:02d} s".replace(" 00 s", "")
+    return f"{seconds // 3600} h {(seconds % 3600) // 60:02d} min"
+
+
+def fmt_size(num_bytes: float) -> str:
+    for unit in ["o", "Ko", "Mo", "Go"]:
+        if num_bytes < 1024:
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024
+    return f"{num_bytes:.1f} To"
+
+
+def run_ffmpeg_with_progress(cmd: list, total_duration: float, on_progress=None):
+    """
+    Exécute ffmpeg en capturant sa progression réelle via -progress pipe:1.
+    on_progress(fraction) est appelé avec la fraction du fichier traité.
+    """
+    proc = subprocess.Popen(
+        cmd + ["-nostats", "-progress", "pipe:1", "-v", "quiet"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    for line in proc.stdout:
+        if line.startswith("out_time_ms=") and on_progress and total_duration > 0:
+            try:
+                out_seconds = float(line.strip().split("=")[1]) / 1_000_000
+            except ValueError:
+                continue
+            if out_seconds > 0:
+                on_progress(min(out_seconds / total_duration, 1.0))
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
 # ---------------------------------------------------------------------------
@@ -110,9 +225,11 @@ def sanitize_filename(name: str) -> str:
     ).rstrip().replace(" ", "_")
 
 
-def download_audio(url: str, output_dir: Path, use_cache: bool = True) -> tuple[Path, dict]:
+def download_audio(url: str, output_dir: Path, use_cache: bool = True,
+                   phase_progress=None) -> tuple[Path, dict]:
     """
     Télécharge l'audio d'une vidéo YouTube et le convertit en MP3 128kbps.
+    phase_progress(frac_0_1, message) est appelé pendant le téléchargement.
     Returns: (chemin_mp3, info_video)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -129,6 +246,24 @@ def download_audio(url: str, output_dir: Path, use_cache: bool = True) -> tuple[
               f"la limite Mistral est de {MAX_AUDIO_HOURS}h par requête.")
 
     filename = sanitize_filename(title)
+
+    def _hook(d):
+        if not phase_progress:
+            return
+        status = d.get("status")
+        if status == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            done = d.get("downloaded_bytes", 0)
+            if total > 0:
+                frac = min(done / total, 1.0)
+                phase_progress(
+                    frac,
+                    f"Téléchargement {frac * 100:.0f}% "
+                    f"({fmt_size(done)} / {fmt_size(total)})",
+                )
+        elif status == "finished":
+            phase_progress(0.97, "Conversion MP3...")
+
     ydl_opts = {
         "format": "bestaudio/best",
         "postprocessor_args": ["-threads", "0"],
@@ -137,6 +272,7 @@ def download_audio(url: str, output_dir: Path, use_cache: bool = True) -> tuple[
                             "preferredquality": AUDIO_BITRATE}],
         "outtmpl": str(output_dir / f"{filename}.%(ext)s"),
         "quiet": False, "no_warnings": True,
+        "progress_hooks": [_hook],
     }
     print("Téléchargement et conversion MP3...")
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -157,11 +293,13 @@ def download_audio(url: str, output_dir: Path, use_cache: bool = True) -> tuple[
 
 
 def prepare_local_audio(audio_path: Path, output_dir: Path,
-                         start: Optional[float] = None,
-                         end: Optional[float] = None) -> tuple[Path, dict]:
+                        start: Optional[float] = None,
+                        end: Optional[float] = None,
+                        phase_progress=None) -> tuple[Path, dict]:
     """
     Prépare un fichier audio local : conversion en MP3 128kbps si nécessaire,
     et extraction d'un segment si start/end sont spécifiés.
+    phase_progress(frac_0_1, message) est appelé pendant ffmpeg.
     Returns: (chemin_mp3, info_dict)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -180,6 +318,11 @@ def prepare_local_audio(audio_path: Path, output_dir: Path,
         "webpage_url": str(audio_path),
     }
 
+    def _ffmpeg_progress(label: str):
+        def _on_frac(frac: float):
+            phase_progress(frac, f"{label} {frac * 100:.0f}%")
+        return _on_frac
+
     if start is not None or end is not None:
         seg_start = start or 0
         seg_end = end or duration
@@ -192,7 +335,7 @@ def prepare_local_audio(audio_path: Path, output_dir: Path,
 
         mp3_path = output_dir / f"{sanitize_filename(info['title'])}.mp3"
         cmd = [
-            "ffmpeg", "-y", "-v", "quiet",
+            "ffmpeg", "-y",
             "-i", str(audio_path),
             "-ss", str(seg_start),
             "-to", str(seg_end),
@@ -200,7 +343,7 @@ def prepare_local_audio(audio_path: Path, output_dir: Path,
             "-threads", "0",
             str(mp3_path),
         ]
-        subprocess.run(cmd, check=True)
+        run_ffmpeg_with_progress(cmd, seg_duration, _ffmpeg_progress("Extraction du segment"))
     elif audio_path.suffix.lower() == ".mp3":
         mp3_path = audio_path
         print(f"Coût est. : ${estimate_cost(duration):.2f}")
@@ -209,13 +352,13 @@ def prepare_local_audio(audio_path: Path, output_dir: Path,
         print(f"Conversion en MP3 {AUDIO_BITRATE}...")
         print(f"Coût est. : ${estimate_cost(duration):.2f}")
         cmd = [
-            "ffmpeg", "-y", "-v", "quiet",
+            "ffmpeg", "-y",
             "-i", str(audio_path),
             "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
             "-threads", "0",
             str(mp3_path),
         ]
-        subprocess.run(cmd, check=True)
+        run_ffmpeg_with_progress(cmd, duration, _ffmpeg_progress("Conversion"))
 
     file_size_mb = mp3_path.stat().st_size / (1024 * 1024)
     print(f"Audio    : {mp3_path.name} ({file_size_mb:.1f} MB)")
@@ -255,10 +398,12 @@ def _split_one_chunk(args: tuple[str, str, str, int, float]) -> tuple[str, float
 
 def split_audio(mp3_path: Path, output_dir: Path,
                 start: Optional[float] = None,
-                end: Optional[float] = None) -> list[tuple[Path, float]]:
+                end: Optional[float] = None,
+                phase_progress=None) -> list[tuple[Path, float]]:
     """
     Découpe un fichier audio en chunks de CHUNK_SECONDS secondes.
     Si start/end sont donnés, ne découpe que ce segment.
+    phase_progress(frac_0_1, message) est appelé à chaque chunk produit.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     total_duration = get_audio_duration_seconds(mp3_path)
@@ -301,6 +446,8 @@ def split_audio(mp3_path: Path, output_dir: Path,
             chunk_mb = chunk_path.stat().st_size / (1024 * 1024)
             print(f"  Chunk {i}/{len(tasks)}: {chunk_path.name} "
                   f"({chunk_mb:.1f} MB, {timedelta(seconds=int(chunk_dur))})")
+            if phase_progress:
+                phase_progress(i / len(tasks), f"Découpage {i}/{len(tasks)}")
     return chunks
 
 
@@ -562,7 +709,13 @@ def run_pipeline(
 ) -> Path:
     """
     Pipeline complet : download/local → split → transcribe → save.
-    Callbacks optionnels pour l'UI (progress_callback(float), log_callback(str), cancel_check() -> bool).
+
+    progress_callback(fraction: float, message: str) reçoit la progression
+    globale [0..1] calée sur ce qui se passe réellement (octets téléchargés,
+    avancement ffmpeg, chunks transcrits) avec un message explicite.
+    Entre deux jalons fiables (ex. requête API), la barre continue d'avancer
+    lentement vers un plafond avec marge pour montrer l'activité.
+
     Returns: chemin du fichier de transcription.
     """
     def _log(msg):
@@ -571,108 +724,170 @@ def run_pipeline(
         else:
             print(msg)
 
-    def _progress(frac):
-        if progress_callback:
-            progress_callback(frac)
-
+    rep = ProgressReporter(progress_callback)
     out_dir = transcripts_dir or OUTPUT_DIR
 
-    # --- Étape 1 : Audio ---
-    if cancel_check and cancel_check():
-        raise InterruptedError("Annulé par l'utilisateur")
-
-    if is_local_file:
-        _log("Préparation du fichier audio local...")
-        mp3_path, video_info = prepare_local_audio(Path(source), TEMP_DIR, start, end)
-    else:
-        _log("Téléchargement audio...")
-        mp3_path, video_info = download_audio(source, TEMP_DIR, use_cache)
-        # Si segment demandé sur vidéo YouTube, on découpe après le download
-        if start is not None or end is not None:
-            total_dur = get_audio_duration_seconds(mp3_path)
-            seg_start = start or 0
-            seg_end = end or total_dur
-            seg_path = TEMP_DIR / f"{mp3_path.stem}_segment.mp3"
-            _log(f"Extraction segment {format_timestamp(seg_start)} - {format_timestamp(seg_end)}")
-            cmd = ["ffmpeg", "-y", "-v", "quiet",
-                   "-i", str(mp3_path),
-                   "-ss", str(seg_start), "-to", str(seg_end),
-                   "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
-                   "-threads", "0", str(seg_path)]
-            subprocess.run(cmd, check=True)
-            mp3_path.unlink(missing_ok=True)
-            mp3_path = seg_path
-            video_info["duration"] = int(seg_end - seg_start)
-
-    _progress(0.20)
-
-    # --- Étape 2a : Découpage si nécessaire ---
-    if cancel_check and cancel_check():
-        raise InterruptedError("Annulé par l'utilisateur")
-
-    audio_duration = get_audio_duration_seconds(mp3_path)
-    needs_split = audio_duration > MAX_AUDIO_SECONDS
-
-    if needs_split:
-        _log("Découpage audio...")
-        chunks = split_audio(mp3_path, TEMP_DIR / "chunks")
-        if cancel_check and cancel_check():
-            raise InterruptedError("Annulé par l'utilisateur")
-        audio_files = chunks
-    else:
-        audio_files = [(mp3_path, 0.0)]
-
-    _progress(0.30)
-
-    # --- Étape 2b : Transcription ---
-    results = []
-    total = len(audio_files)
-    for i, (chunk_path, offset) in enumerate(audio_files, 1):
+    try:
+        # --- Étape 1 : Audio (URL: 0-35%, local: 0-15%) ---
         if cancel_check and cancel_check():
             raise InterruptedError("Annulé par l'utilisateur")
 
-        if total > 1:
-            _log(f"Transcription chunk {i}/{total}...")
+        if is_local_file:
+            audio_start, audio_end = 0.0, 0.15
+            _log("Préparation du fichier audio local...")
+            rep.set(0.0, ceiling=audio_end, rate=0.005,
+                    message="Préparation du fichier audio...")
+            rep.start_ticker()
+            mp3_path, video_info = prepare_local_audio(
+                Path(source), TEMP_DIR, start, end,
+                phase_progress=lambda f, msg: rep.set(
+                    audio_start + (audio_end - audio_start) * min(f, 1.0), message=msg),
+            )
+        else:
+            audio_start, audio_end = 0.0, 0.35
+            _log("Téléchargement audio...")
+            rep.set(0.0, ceiling=audio_end, rate=0.002,
+                    message="Récupération des métadonnées...")
+            rep.start_ticker()
+            mp3_path, video_info = download_audio(
+                source, TEMP_DIR, use_cache,
+                phase_progress=lambda f, msg: rep.set(
+                    audio_start + (audio_end - audio_start) * min(f, 1.0), message=msg),
+            )
+            # Si segment demandé sur vidéo YouTube, on découpe après le download
+            if start is not None or end is not None:
+                total_dur = get_audio_duration_seconds(mp3_path)
+                seg_start = start or 0
+                seg_end = end or total_dur
+                seg_path = TEMP_DIR / f"{mp3_path.stem}_segment.mp3"
+                _log(f"Extraction segment {format_timestamp(seg_start)} - {format_timestamp(seg_end)}")
+                cmd = ["ffmpeg", "-y",
+                       "-i", str(mp3_path),
+                       "-ss", str(seg_start),
+                       "-to", str(seg_end),
+                       "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
+                       "-threads", "0", str(seg_path)]
+                run_ffmpeg_with_progress(
+                    cmd, seg_end - seg_start,
+                    lambda f: rep.set(audio_end - 0.02 + 0.02 * f,
+                                      message=f"Extraction du segment {format_timestamp(seg_start)} - "
+                                              f"{format_timestamp(seg_end)}"))
+                mp3_path.unlink(missing_ok=True)
+                mp3_path = seg_path
+                video_info["duration"] = int(seg_end - seg_start)
 
-        result = transcribe_with_retry(
-            mp3_path=chunk_path,
-            api_key=api_key,
-            language=language,
+        rep.set(audio_end)
+
+        # --- Étape 2a : Découpage si nécessaire (+5%) ---
+        if cancel_check and cancel_check():
+            raise InterruptedError("Annulé par l'utilisateur")
+
+        audio_duration = get_audio_duration_seconds(mp3_path)
+        needs_split = audio_duration > MAX_AUDIO_SECONDS
+        split_start, split_end = audio_end, audio_end + 0.05
+
+        if needs_split:
+            _log("Découpage audio...")
+            rep.set(split_start, message="Découpage audio...")
+            chunks = split_audio(
+                mp3_path, TEMP_DIR / "chunks",
+                phase_progress=lambda f, msg: rep.set(
+                    split_start + (split_end - split_start) * f, message=msg),
+            )
+            if cancel_check and cancel_check():
+                raise InterruptedError("Annulé par l'utilisateur")
+            audio_files = chunks
+        else:
+            audio_files = [(mp3_path, 0.0)]
+
+        rep.set(split_end)
+
+        # --- Étape 2b : Transcription (→ 95%), avec estimation du temps restant ---
+        transcribe_start = split_end
+        transcribe_end = 0.95
+        transcribe_span = transcribe_end - transcribe_start
+
+        chunk_durations = []
+        for c, _ in audio_files:
+            try:
+                chunk_durations.append(get_audio_duration_seconds(c))
+            except Exception:
+                chunk_durations.append(0.0)
+        total_audio = sum(chunk_durations) or 1.0
+
+        # Vitesse apprise : secondes de transcription par seconde d'audio,
+        # ajustée à chaque chunk terminé (lissage 50/50).
+        speed = TRANSCRIBE_SPEED_DEFAULT
+        results = []
+        total = len(audio_files)
+        acc = 0.0
+        for i, (chunk_path, offset) in enumerate(audio_files, 1):
+            if cancel_check and cancel_check():
+                raise InterruptedError("Annulé par l'utilisateur")
+
+            chunk_dur = chunk_durations[i - 1]
+            chunk_span = transcribe_span * (chunk_dur / total_audio)
+            chunk_base = transcribe_start + transcribe_span * (acc / total_audio)
+            est = max(chunk_dur * speed, 1.0)
+            remaining = est + (total_audio - acc - chunk_dur) * speed
+            label = "Transcription" if total == 1 else f"Transcription chunk {i}/{total}"
+            rep.set(chunk_base,
+                    ceiling=chunk_base + chunk_span * 0.9,  # marge sous la cible
+                    rate=(chunk_span * 0.9) / est,          # arriver "à l'heure"
+                    message=f"{label} — ~{fmt_duration(remaining)} restantes")
+            rep.start_ticker()
+
+            if total > 1:
+                _log(f"Transcription chunk {i}/{total}...")
+            t0 = time.monotonic()
+            result = transcribe_with_retry(
+                mp3_path=chunk_path,
+                api_key=api_key,
+                language=language,
+                diarize=diarize,
+                timestamp_granularities=timestamp_granularities,
+                context_bias=context_bias,
+            )
+            elapsed = time.monotonic() - t0
+            if chunk_dur > 0:
+                speed = 0.5 * speed + 0.5 * (elapsed / chunk_dur)
+
+            rep.stop_ticker()
+            acc += chunk_dur
+            rep.set(chunk_base + chunk_span)
+
+            results.append((result, offset))
+            text = result.get("text", "")
+            _log(f"Chunk {i}/{total} transcrit: {len(text)} caractères")
+
+        # --- Étape 3 : Sauvegarde (95% → 100%) ---
+        _log("Sauvegarde...")
+        rep.set(transcribe_end, message="Sauvegarde...")
+
+        name = output_name or sanitize_filename(video_info.get("title", "transcription"))
+        output_path = out_dir / f"{name}.md"
+
+        save_transcription(
+            results=results,
+            video_info=video_info,
+            output_path=output_path,
+            audio_name=mp3_path.name,
             diarize=diarize,
             timestamp_granularities=timestamp_granularities,
-            context_bias=context_bias,
         )
-        results.append((result, offset))
-        text = result.get("text", "")
-        _log(f"Chunk {i}/{total} transcrit: {len(text)} caractères")
 
-        _progress(0.30 + 0.60 * (i / total))
+        # Export SRT/VTT
+        if export_srt_file:
+            srt_path = out_dir / f"{name}.srt"
+            export_srt(results, srt_path)
+        if export_vtt_file:
+            vtt_path = out_dir / f"{name}.vtt"
+            export_vtt(results, vtt_path)
 
-    # --- Étape 3 : Sauvegarde ---
-    _log("Sauvegarde...")
-    _progress(0.95)
+        rep.set(1.0, message="Terminé")
 
-    name = output_name or sanitize_filename(video_info.get("title", "transcription"))
-    output_path = out_dir / f"{name}.md"
-
-    save_transcription(
-        results=results,
-        video_info=video_info,
-        output_path=output_path,
-        audio_name=mp3_path.name,
-        diarize=diarize,
-        timestamp_granularities=timestamp_granularities,
-    )
-
-    # Export SRT/VTT
-    if export_srt_file:
-        srt_path = out_dir / f"{name}.srt"
-        export_srt(results, srt_path)
-    if export_vtt_file:
-        vtt_path = out_dir / f"{name}.vtt"
-        export_vtt(results, vtt_path)
-
-    _progress(1.0)
+    finally:
+        rep.stop_ticker()
 
     # Nettoyage
     if not keep_audio:

@@ -870,7 +870,7 @@ class VoxCastWindow:
                         transcripts_dir=self.transcripts_dir,
                         export_srt_file=opts.get("export_srt", False),
                         export_vtt_file=opts.get("export_vtt", False),
-                        progress_callback=lambda f: GLib.idle_add(self.progress_bar.set_fraction, f),
+                        progress_callback=lambda f, msg: GLib.idle_add(self._on_pipeline_progress, f, msg),
                         cancel_check=lambda: self.cancelled,
                     )
                     item.status = STATUS_DONE
@@ -909,6 +909,14 @@ class VoxCastWindow:
             css = STATUS_COLORS.get(item.status, "")
             if css:
                 item.status_label.add_css_class(css)
+
+    def _on_pipeline_progress(self, frac: float, message: str):
+        """Colle la barre de progression et le statut sur l'activité réelle du pipeline."""
+        if not self.running:
+            return
+        self.progress_bar.set_fraction(min(frac, 1.0))
+        if message:
+            self.status_label.set_label(message)
 
     def _on_queue_done(self):
         self.running = False
