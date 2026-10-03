@@ -889,12 +889,15 @@ def run_pipeline(
     finally:
         rep.stop_ticker()
 
-    # Nettoyage
+    # Nettoyage : uniquement les fichiers temporaires, jamais la source locale
     if not keep_audio:
-        mp3_path.unlink(missing_ok=True)
+        temp_dir = TEMP_DIR.resolve()
+        if mp3_path.resolve().is_relative_to(temp_dir):
+            mp3_path.unlink(missing_ok=True)
         if needs_split:
             for c, _ in audio_files:
-                c.unlink(missing_ok=True)
+                if c.resolve().is_relative_to(temp_dir):
+                    c.unlink(missing_ok=True)
             try:
                 (TEMP_DIR / "chunks").rmdir()
             except OSError:
