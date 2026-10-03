@@ -88,14 +88,13 @@ Ou saisissez-la dans l'interface graphique via Paramètres > Clé API.
 L'interface permet de :
 - Saisir une URL YouTube ou un chemin de fichier local (ou glisser-déposer un fichier)
 - Voir l'estimation du coût et de la durée en temps réel
-- Configurer la langue, timestamps, diarisation, context bias, export SRT/VTT
-- Spécifier un segment précis (transcription partielle)
-- Ajouter plusieurs sources à la **file d'attente**
+- Replier les options avancées (langue, timestamps, diarisation, context bias, segment, export SRT/VTT)
+- Ajouter plusieurs sources à la **file d'attente** avec une barre de progression par élément
 - Démarrer/annuler le traitement de la file
 - Suivre la progression en temps réel (téléchargement, transcription, estimation du temps restant)
 - Recevoir les retours (succès, erreurs, annulations) via des toasts GNOME
 - **Rechercher** dans les transcriptions par nom ou par contenu
-- Ouvrir, supprimer, exporter en SRT/VTT les transcriptions
+- Agir sur chaque transcription via son menu (⋮) : ouvrir (ou double-clic), exporter en SRT/VTT, supprimer
 - Configurer la clé API et le dossier de sortie
 
 Les messages techniques du pipeline (yt-dlp, ffmpeg, API Mistral) ne sont plus affichés dans l'interface : ils vont dans le shell d'où l'application est lancée et dans le fichier `voxccast.log`.

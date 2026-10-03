@@ -101,9 +101,11 @@ class QueueItem:
         self.options = options  # language, diarize, timestamps, etc.
         self.status = STATUS_PENDING
         self.error = None
+        self.progress = 0.0
         self.output_path: Optional[Path] = None
         self.row_widget: Optional[Gtk.Widget] = None
         self.status_label: Optional[Gtk.Label] = None
+        self.progress_bar: Optional[Gtk.ProgressBar] = None
 
 
 # ============================================================================
@@ -125,7 +127,6 @@ class VoxCastWindow:
         self.cancelled = False
         self.queue: list[QueueItem] = []
         self.queue_thread: Optional[threading.Thread] = None
-        self.selected_transcript: Optional[dict] = None
         self.all_transcripts: list[dict] = []
 
         self.load_settings()
@@ -164,7 +165,6 @@ class VoxCastWindow:
         main_box.set_size_request(700, -1)  # Largeur min, pas de hauteur min
 
         main_box.append(self._build_source_section())
-        main_box.append(self._build_options_section())
         main_box.append(self._build_queue_section())
         main_box.append(self._build_transcripts_section())
         main_box.append(self._build_status_section())
@@ -214,16 +214,12 @@ class VoxCastWindow:
     # ========================================================================
 
     def _build_source_section(self) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup(title="Source")
+        group = Adw.PreferencesGroup(title="Nouvelle transcription")
 
         # URL ou fichier
-        source_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        source_label = Gtk.Label(label="URL YouTube ou fichier audio", halign=Gtk.Align.START)
-        source_label.add_css_class("caption")
-
         source_row = Gtk.Box(spacing=10)
         self.url_entry = Gtk.Entry(
-            placeholder_text="https://www.youtube.com/watch?v=... ou glissez un fichier",
+            placeholder_text="URL YouTube ou glissez un fichier audio ici",
             hexpand=True,
         )
         self.url_entry.connect("activate", lambda *_: self.on_add_to_queue())
@@ -235,14 +231,19 @@ class VoxCastWindow:
         )
         browse_btn.connect("clicked", self.on_browse_audio)
 
+        add_btn = Gtk.Button(
+            label="Ajouter",
+            icon_name="list-add-symbolic",
+        )
+        add_btn.add_css_class("suggested-action")
+        add_btn.connect("clicked", self.on_add_to_queue)
+
         source_row.append(self.url_entry)
         source_row.append(browse_btn)
+        source_row.append(add_btn)
+        group.add(source_row)
 
-        source_box.append(source_label)
-        source_box.append(source_row)
-        group.add(source_box)
-
-        # Estimation du coût
+        # Estimation durée / coût (remplie automatiquement)
         self.cost_label = Gtk.Label(
             label="",
             halign=Gtk.Align.START,
@@ -251,161 +252,122 @@ class VoxCastWindow:
         self.cost_label.add_css_class("dim-label")
         group.add(self.cost_label)
 
-        # Nom personnalisé
-        name_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        name_label = Gtk.Label(label="Nom de sortie (optionnel)", halign=Gtk.Align.START)
-        name_label.add_css_class("caption")
-        self.name_entry = Gtk.Entry(
-            placeholder_text="Mon titre personnalisé",
-            hexpand=True,
-        )
-        name_box.append(name_label)
-        name_box.append(self.name_entry)
-        group.add(name_box)
+        # ===== Options avancées (repliées par défaut) =====
+        options = Adw.ExpanderRow(title="Options avancées")
 
-        # Segment (transcription partielle)
-        seg_box = Gtk.Box(spacing=15)
-        seg_label = Gtk.Label(label="Segment (optionnel)", halign=Gtk.Align.START)
-        seg_label.add_css_class("caption")
-
-        self.start_entry = Gtk.Entry(
-            placeholder_text="Début (HH:MM:SS)",
-            width_chars=12,
-        )
-        self.end_entry = Gtk.Entry(
-            placeholder_text="Fin (HH:MM:SS)",
-            width_chars=12,
-        )
-
-        seg_row = Gtk.Box(spacing=10)
-        seg_row.append(seg_label)
-        seg_row.append(self.start_entry)
-        dash_label = Gtk.Label(label="→")
-        seg_row.append(dash_label)
-        seg_row.append(self.end_entry)
-        group.add(seg_row)
-
-        # Boutons
-        buttons_box = Gtk.Box(spacing=10, halign=Gtk.Align.END, margin_top=10)
-
-        self.add_queue_btn = Gtk.Button(
-            label="Ajouter à la file",
-            icon_name="list-add-symbolic",
-            halign=Gtk.Align.END,
-        )
-        self.add_queue_btn.add_css_class("suggested-action")
-        self.add_queue_btn.connect("clicked", self.on_add_to_queue)
-        self.add_queue_btn.set_sensitive(False)
-
-        buttons_box.append(self.add_queue_btn)
-        group.add(buttons_box)
-
-        return group
-
-    def _build_options_section(self) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup(title="Options")
+        # Nom de sortie
+        name_row = Adw.EntryRow(title="Nom de sortie (auto si vide)")
+        self.name_entry = name_row
+        options.add_row(name_row)
 
         # Langue + Timestamps
-        options_row = Gtk.Box(spacing=15)
-
-        lang_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        lang_label = Gtk.Label(label="Langue", halign=Gtk.Align.START)
-        lang_label.add_css_class("caption")
+        lang_row = Adw.ActionRow(title="Langue", subtitle="Forcer la langue améliore la précision")
         lang_model = Gtk.StringList()
         for _, name in LANGUAGES:
             lang_model.append(name)
-        self.lang_dropdown = Gtk.DropDown(model=lang_model)
-        self.lang_dropdown.set_tooltip_text("Forcer la langue améliore la précision")
-        lang_box.append(lang_label)
-        lang_box.append(self.lang_dropdown)
-        options_row.append(lang_box)
+        self.lang_dropdown = Gtk.DropDown(model=lang_model, valign=Gtk.Align.CENTER)
+        lang_row.add_suffix(self.lang_dropdown)
+        lang_row.set_activatable_widget(self.lang_dropdown)
+        options.add_row(lang_row)
 
-        ts_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        ts_label = Gtk.Label(label="Timestamps", halign=Gtk.Align.START)
-        ts_label.add_css_class("caption")
+        ts_row = Adw.ActionRow(title="Timestamps", subtitle="Inclure les horaires dans la sortie")
         ts_model = Gtk.StringList()
         for _, name in TIMESTAMP_OPTIONS:
             ts_model.append(name)
-        self.ts_dropdown = Gtk.DropDown(model=ts_model)
-        ts_box.append(ts_label)
-        ts_box.append(self.ts_dropdown)
-        options_row.append(ts_box)
+        self.ts_dropdown = Gtk.DropDown(model=ts_model, valign=Gtk.Align.CENTER)
+        ts_row.add_suffix(self.ts_dropdown)
+        ts_row.set_activatable_widget(self.ts_dropdown)
+        options.add_row(ts_row)
 
-        group.add(options_row)
-
-        # Toggles
-        toggles_row = Gtk.Box(spacing=15)
-
+        # Diarisation
         diarize_row = Adw.ActionRow(title="Diarisation", subtitle="Identifier les speakers")
-        self.diarize_switch = Gtk.Switch(halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
+        self.diarize_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         diarize_row.add_suffix(self.diarize_switch)
         diarize_row.set_activatable_widget(self.diarize_switch)
-        toggles_row.append(diarize_row)
+        options.add_row(diarize_row)
 
-        keep_row = Adw.ActionRow(title="Garder l'audio", subtitle="Conserver le MP3")
-        self.keep_switch = Gtk.Switch(halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
+        # Garder l'audio
+        keep_row = Adw.ActionRow(title="Garder l'audio", subtitle="Conserver le MP3 téléchargé")
+        self.keep_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         keep_row.add_suffix(self.keep_switch)
         keep_row.set_activatable_widget(self.keep_switch)
-        toggles_row.append(keep_row)
+        options.add_row(keep_row)
 
-        group.add(toggles_row)
+        # Segment (transcription partielle)
+        seg_row = Adw.ActionRow(title="Segment", subtitle="Transcrire seulement une partie (HH:MM:SS)")
+        seg_box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+        self.start_entry = Gtk.Entry(placeholder_text="Début", width_chars=7)
+        self.end_entry = Gtk.Entry(placeholder_text="Fin", width_chars=7)
+        seg_box.append(self.start_entry)
+        seg_box.append(Gtk.Label(label="→"))
+        seg_box.append(self.end_entry)
+        seg_row.add_suffix(seg_box)
+        options.add_row(seg_row)
 
         # Context bias
-        bias_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        bias_label = Gtk.Label(label="Context bias (optionnel)", halign=Gtk.Align.START)
-        bias_label.add_css_class("caption")
-        self.bias_entry = Gtk.Entry(
-            placeholder_text="Termes séparés par espaces (max 100)",
-            hexpand=True,
-        )
-        bias_box.append(bias_label)
-        bias_box.append(self.bias_entry)
-        group.add(bias_box)
+        bias_row = Adw.EntryRow(title="Context bias (termes, espaces, max 100)")
+        self.bias_entry = bias_row
+        options.add_row(bias_row)
 
-        # Export SRT/VTT
-        export_row = Gtk.Box(spacing=15)
-
-        srt_row = Adw.ActionRow(title="Export SRT", subtitle="Sous-titres SubRip")
-        self.srt_switch = Gtk.Switch(halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
+        # Exports sous-titres
+        srt_row = Adw.ActionRow(title="Exporter en SRT", subtitle="Sous-titres SubRip")
+        self.srt_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         srt_row.add_suffix(self.srt_switch)
         srt_row.set_activatable_widget(self.srt_switch)
-        export_row.append(srt_row)
+        options.add_row(srt_row)
 
-        vtt_row = Adw.ActionRow(title="Export VTT", subtitle="Sous-titres WebVTT")
-        self.vtt_switch = Gtk.Switch(halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
+        vtt_row = Adw.ActionRow(title="Exporter en VTT", subtitle="Sous-titres WebVTT")
+        self.vtt_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         vtt_row.add_suffix(self.vtt_switch)
         vtt_row.set_activatable_widget(self.vtt_switch)
-        export_row.append(vtt_row)
+        options.add_row(vtt_row)
 
-        group.add(export_row)
-
-        # Boutons start/stop
-        buttons_box = Gtk.Box(spacing=10, halign=Gtk.Align.END, margin_top=10)
-
-        self.cancel_btn = Gtk.Button(
-            label="Annuler",
-            icon_name="process-stop-symbolic",
-            sensitive=False,
-        )
-        self.cancel_btn.connect("clicked", self.on_cancel_clicked)
-
-        self.start_btn = Gtk.Button(
-            label="Démarrer la file",
-            icon_name="media-playback-start-symbolic",
-            halign=Gtk.Align.END,
-        )
-        self.start_btn.add_css_class("suggested-action")
-        self.start_btn.connect("clicked", self.on_start_queue)
-        self.start_btn.set_sensitive(False)
-
-        buttons_box.append(self.cancel_btn)
-        buttons_box.append(self.start_btn)
-        group.add(buttons_box)
-
+        group.add(options)
         return group
 
     def _build_queue_section(self) -> Adw.PreferencesGroup:
         group = Adw.PreferencesGroup(title="File d'attente")
+
+        # Actions de la file dans le header : Démarrer / Annuler / menu ⋮
+        header_box = Gtk.Box(spacing=6)
+
+        self.start_btn = Gtk.Button(
+            label="Démarrer",
+            icon_name="media-playback-start-symbolic",
+        )
+        self.start_btn.add_css_class("suggested-action")
+        self.start_btn.set_sensitive(False)
+        self.start_btn.connect("clicked", self.on_start_queue)
+
+        self.cancel_btn = Gtk.Button(
+            icon_name="process-stop-symbolic",
+            tooltip_text="Annuler le traitement en cours",
+            sensitive=False,
+        )
+        self.cancel_btn.connect("clicked", self.on_cancel_clicked)
+
+        queue_menu_btn = Gtk.MenuButton(
+            icon_name="view-more-symbolic",
+            tooltip_text="Actions sur la file",
+        )
+        queue_menu = Gio.Menu()
+        queue_menu.append("Réessayer les échecs", "queue.retry")
+        queue_menu.append("Nettoyer les terminés", "queue.clear")
+        queue_menu_btn.set_menu_model(queue_menu)
+
+        queue_actions = Gio.SimpleActionGroup()
+        act_retry = Gio.SimpleAction(name="retry")
+        act_retry.connect("activate", lambda *_: self.on_retry_failed())
+        act_clear = Gio.SimpleAction(name="clear")
+        act_clear.connect("activate", lambda *_: self.on_clear_done())
+        queue_actions.add_action(act_retry)
+        queue_actions.add_action(act_clear)
+        queue_menu_btn.insert_action_group("queue", queue_actions)
+
+        header_box.append(self.start_btn)
+        header_box.append(self.cancel_btn)
+        header_box.append(queue_menu_btn)
+        group.set_header_suffix(header_box)
 
         self.queue_list = Gtk.ListBox(
             selection_mode=Gtk.SelectionMode.SINGLE,
@@ -418,62 +380,39 @@ class VoxCastWindow:
             vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
             child=self.queue_list,
         )
-        scrolled.set_size_request(-1, 100)
+        scrolled.set_size_request(-1, 120)
 
-        queue_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        queue_box.append(scrolled)
-
-        # Boutons de la file
-        queue_buttons = Gtk.Box(spacing=10, halign=Gtk.Align.END, margin_top=5)
-
-        self.clear_done_btn = Gtk.Button(
-            label="Nettoyer terminés",
-            icon_name="edit-clear-symbolic",
-            tooltip_text="Retirer les éléments terminés/annulés",
-        )
-        self.clear_done_btn.connect("clicked", self.on_clear_done)
-
-        self.retry_btn = Gtk.Button(
-            label="Réessayer",
-            icon_name="view-refresh-symbolic",
-            tooltip_text="Remettre les éléments en erreur dans la file",
-        )
-        self.retry_btn.connect("clicked", self.on_retry_failed)
-
-        self.remove_selected_btn = Gtk.Button(
-            label="Retirer",
-            icon_name="list-remove-symbolic",
-            sensitive=False,
-        )
-        self.remove_selected_btn.connect("clicked", self.on_remove_queue_item)
-
-        queue_buttons.append(self.retry_btn)
-        queue_buttons.append(self.clear_done_btn)
-        queue_buttons.append(self.remove_selected_btn)
-        queue_box.append(queue_buttons)
-
-        group.add(queue_box)
+        group.add(scrolled)
         return group
 
     def _build_transcripts_section(self) -> Adw.PreferencesGroup:
         group = Adw.PreferencesGroup(title="Transcriptions")
 
-        # Barre de recherche
-        search_box = Gtk.Box(spacing=10, margin_bottom=10)
+        # Recherche + bouton dossier dans le header
         self.search_entry = Gtk.SearchEntry(
-            placeholder_text="Rechercher dans les transcriptions...",
+            placeholder_text="Rechercher (nom ou contenu)...",
             hexpand=True,
         )
         self.search_entry.connect("search-changed", self.on_search_changed)
-        search_box.append(self.search_entry)
-        group.add(search_box)
+
+        folder_btn = Gtk.Button(
+            icon_name="folder-open-symbolic",
+            tooltip_text="Ouvrir le dossier des transcriptions",
+        )
+        folder_btn.connect("clicked", self.on_open_folder_clicked)
+
+        header_box = Gtk.Box(spacing=6)
+        header_box.append(self.search_entry)
+        header_box.append(folder_btn)
+        group.set_header_suffix(header_box)
 
         self.transcripts_list = Gtk.ListBox(
             selection_mode=Gtk.SelectionMode.SINGLE,
             show_separators=True,
             css_classes=["navigation-sidebar"],
         )
-        self.transcripts_list.connect("row-selected", self.on_transcript_selected)
+        # Double-clic sur une ligne -> ouvrir la transcription
+        self.transcripts_list.connect("row-activated", self._on_transcript_activated)
 
         scrolled = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER,
@@ -482,56 +421,7 @@ class VoxCastWindow:
         )
         scrolled.set_size_request(-1, 150)
 
-        list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        list_box.append(scrolled)
-
-        list_buttons = Gtk.Box(spacing=10, halign=Gtk.Align.END, margin_top=10)
-
-        self.export_srt_btn = Gtk.Button(
-            label="SRT",
-            icon_name="document-save-as-symbolic",
-            tooltip_text="Exporter la transcription sélectionnée en SRT",
-            sensitive=False,
-        )
-        self.export_srt_btn.connect("clicked", self.on_export_srt)
-
-        self.export_vtt_btn = Gtk.Button(
-            label="VTT",
-            icon_name="document-save-as-symbolic",
-            tooltip_text="Exporter la transcription sélectionnée en VTT",
-            sensitive=False,
-        )
-        self.export_vtt_btn.connect("clicked", self.on_export_vtt)
-
-        self.open_btn = Gtk.Button(
-            label="Ouvrir",
-            icon_name="document-open-symbolic",
-            sensitive=False,
-        )
-        self.open_btn.connect("clicked", self.on_open_transcript_clicked)
-
-        self.open_folder_btn = Gtk.Button(
-            label="Dossier",
-            icon_name="folder-open-symbolic",
-        )
-        self.open_folder_btn.connect("clicked", self.on_open_folder_clicked)
-
-        self.delete_btn = Gtk.Button(
-            label="Supprimer",
-            icon_name="user-trash-symbolic",
-            sensitive=False,
-        )
-        self.delete_btn.add_css_class("destructive-action")
-        self.delete_btn.connect("clicked", self.on_delete_transcript_clicked)
-
-        list_buttons.append(self.export_srt_btn)
-        list_buttons.append(self.export_vtt_btn)
-        list_buttons.append(self.open_btn)
-        list_buttons.append(self.open_folder_btn)
-        list_buttons.append(self.delete_btn)
-        list_box.append(list_buttons)
-
-        group.add(list_box)
+        group.add(scrolled)
         return group
 
     def _build_status_section(self) -> Adw.PreferencesGroup:
@@ -567,8 +457,10 @@ class VoxCastWindow:
             ("start", ["<Control>space"], self.on_start_queue),
             ("cancel", ["<Control>q"], self.on_cancel_clicked),
             ("refresh", ["<Control>r"], self.refresh_transcripts_list),
-            ("open", ["<Control>o"], self.on_open_transcript_clicked),
-            ("delete", ["<Control>d"], self.on_delete_transcript_clicked),
+            ("open", ["<Control>o"],
+             lambda: self.on_open_transcript_clicked(self._selected_transcript())),
+            ("delete", ["<Control>d"],
+             lambda: self.on_delete_transcript_clicked(self._selected_transcript())),
         ]
 
         for name, accels, callback in shortcuts:
@@ -713,7 +605,7 @@ class VoxCastWindow:
 
         if not self.queue:
             empty = Gtk.Label(
-                label="File vide",
+                label="File vide — ajoutez une URL ou un fichier ci-dessus",
                 halign=Gtk.Align.CENTER,
                 margin_top=8,
                 margin_bottom=8,
@@ -731,58 +623,104 @@ class VoxCastWindow:
         self.start_btn.set_sensitive(len(pending) > 0 and not self.running)
 
     def _create_queue_row(self, item: QueueItem, index: int) -> Gtk.Widget:
-        box = Gtk.Box(spacing=10, halign=Gtk.Align.FILL)
+        box = Gtk.Box(spacing=10, halign=Gtk.Align.FILL, margin_top=6, margin_bottom=6)
 
         # Icône selon le type
         icon_name = "audio-x-generic-symbolic" if item.is_local else "media-playlist-repeat-symbolic"
-        icon = Gtk.Image(icon_name=icon_name, pixel_size=20)
+        icon = Gtk.Image(icon_name=icon_name, pixel_size=20, valign=Gtk.Align.CENTER)
 
-        # Info
-        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        source_short = item.source if len(item.source) <= 60 else item.source[:57] + "..."
+        # Info + barre de progression de l'item
+        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
         name_label = Gtk.Label(
-            label=source_short,
+            label=item.options.get("output_name") or Path(item.source).name or item.source,
             halign=Gtk.Align.START,
             ellipsize=Pango.EllipsizeMode.END,
             max_width_chars=50,
         )
-        name_label.add_css_class("caption")
 
         status_text = STATUS_LABELS.get(item.status, item.status)
+        if item.status == STATUS_ERROR and item.error:
+            status_text = f"Erreur : {item.error}"
         status_label = Gtk.Label(
             label=status_text,
             halign=Gtk.Align.START,
+            ellipsize=Pango.EllipsizeMode.END,
+            max_width_chars=50,
         )
+        status_label.add_css_class("caption")
         css = STATUS_COLORS.get(item.status, "")
         if css:
             status_label.add_css_class(css)
 
+        progress_bar = Gtk.ProgressBar(
+            halign=Gtk.Align.FILL,
+            show_text=False,
+            visible=(item.status == STATUS_RUNNING),
+            fraction=item.progress or 0.0,
+            margin_top=2,
+        )
+
         info_box.append(name_label)
         info_box.append(status_label)
+        info_box.append(progress_bar)
         item.status_label = status_label
+        item.progress_bar = progress_bar
+
+        # Menu par item (⋮) : réessayer / retirer
+        menu_btn = Gtk.MenuButton(
+            icon_name="view-more-symbolic",
+            valign=Gtk.Align.CENTER,
+            tooltip_text="Actions",
+        )
+        menu = Gio.Menu()
+        actions = Gio.SimpleActionGroup()
+        if item.status in (STATUS_ERROR, STATUS_CANCELLED):
+            menu.append("Réessayer", "item.retry")
+            act = Gio.SimpleAction(name="retry")
+            act.connect("activate", lambda *_a, it=item: self._retry_queue_item(it))
+            actions.add_action(act)
+        if item.status != STATUS_RUNNING:
+            menu.append("Retirer de la file", "item.remove")
+            act = Gio.SimpleAction(name="remove")
+            act.connect("activate", lambda *_a, it=item: self._remove_queue_item(it))
+            actions.add_action(act)
+        menu_btn.set_menu_model(menu)
+        menu_btn.insert_action_group("item", actions)
+        menu_btn.set_sensitive(menu.get_n_items() > 0)
 
         box.append(icon)
         box.append(info_box)
-        box.append(Gtk.Box())
+        box.append(menu_btn)
 
         row = Gtk.ListBoxRow(child=box, activatable=False)
         item.row_widget = row
         return row
 
+    def _retry_queue_item(self, item: QueueItem):
+        """Remet un élément en erreur/annulé en attente."""
+        if item.status in (STATUS_ERROR, STATUS_CANCELLED):
+            item.status = STATUS_PENDING
+            item.error = None
+            self._refresh_queue_list()
+
+    def _remove_queue_item(self, item: QueueItem):
+        """Retire un élément de la file."""
+        if item.status == STATUS_RUNNING:
+            self.toast("Impossible de retirer un élément en cours.", "error")
+            return
+        if item in self.queue:
+            self.queue.remove(item)
+            self._refresh_queue_list()
+
     def on_remove_queue_item(self, button=None):
-        """Retire l'élément sélectionné de la file."""
+        """Retire l'élément sélectionné de la file (raccourci clavier)."""
         selected = self.queue_list.get_selected_row()
         if selected is None:
             return
         idx = selected.get_index()
+        # La première ligne peut être le placeholder "File vide"
         if 0 <= idx < len(self.queue):
-            item = self.queue[idx]
-            if item.status == STATUS_RUNNING:
-                self.toast("Impossible de retirer un élément en cours.", "error")
-                return
-            self.queue.pop(idx)
-            self._refresh_queue_list()
-            self.start_btn.set_sensitive(len(self.queue) > 0)
+            self._remove_queue_item(self.queue[idx])
 
     def on_clear_done(self, button=None):
         """Retire les éléments terminés, en erreur ou annulés."""
@@ -847,6 +785,7 @@ class VoxCastWindow:
                     continue
 
                 item.status = STATUS_RUNNING
+                item.progress = 0.0
                 GLib.idle_add(self._update_queue_item_status, item)
 
                 GLib.idle_add(self.update_status,
@@ -870,7 +809,7 @@ class VoxCastWindow:
                         transcripts_dir=self.transcripts_dir,
                         export_srt_file=opts.get("export_srt", False),
                         export_vtt_file=opts.get("export_vtt", False),
-                        progress_callback=lambda f, msg: GLib.idle_add(self._on_pipeline_progress, f, msg),
+                        progress_callback=lambda f, msg, it=item: GLib.idle_add(self._on_item_progress, it, f, msg),
                         cancel_check=lambda: self.cancelled,
                     )
                     item.status = STATUS_DONE
@@ -910,11 +849,15 @@ class VoxCastWindow:
             if css:
                 item.status_label.add_css_class(css)
 
-    def _on_pipeline_progress(self, frac: float, message: str):
-        """Colle la barre de progression et le statut sur l'activité réelle du pipeline."""
+    def _on_item_progress(self, item: QueueItem, frac: float, message: str):
+        """Colle la barre de l'item ET le statut global sur l'activité réelle du pipeline."""
         if not self.running:
             return
-        self.progress_bar.set_fraction(min(frac, 1.0))
+        item.progress = min(frac, 1.0)
+        if item.progress_bar:
+            item.progress_bar.set_visible(True)
+            item.progress_bar.set_fraction(item.progress)
+        self.progress_bar.set_fraction(item.progress)
         if message:
             self.status_label.set_label(message)
 
@@ -976,10 +919,6 @@ class VoxCastWindow:
             )
             empty.add_css_class("dim-label")
             self.transcripts_list.append(empty)
-            self.open_btn.set_sensitive(False)
-            self.delete_btn.set_sensitive(False)
-            self.export_srt_btn.set_sensitive(False)
-            self.export_vtt_btn.set_sensitive(False)
             return
 
         for t in transcripts:
@@ -1002,10 +941,11 @@ class VoxCastWindow:
         return transcripts
 
     def _create_transcript_row(self, t: dict) -> Gtk.Widget:
-        box = Gtk.Box(spacing=10, halign=Gtk.Align.FILL)
-        icon = Gtk.Image(icon_name="text-x-generic-symbolic", pixel_size=24)
+        box = Gtk.Box(spacing=10, halign=Gtk.Align.FILL, margin_top=6, margin_bottom=6)
+        icon = Gtk.Image(icon_name="text-x-generic-symbolic", pixel_size=24,
+                         valign=Gtk.Align.CENTER)
 
-        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
         name_label = Gtk.Label(
             label=t["name"],
             halign=Gtk.Align.START,
@@ -1025,64 +965,74 @@ class VoxCastWindow:
 
         info_box.append(name_label)
         info_box.append(details)
+
+        # Menu par ligne (⋮) : ouvrir, exporter, supprimer
+        menu_btn = Gtk.MenuButton(
+            icon_name="view-more-symbolic",
+            valign=Gtk.Align.CENTER,
+            tooltip_text="Actions",
+        )
+        menu = Gio.Menu()
+        menu.append("Ouvrir", "tr.open")
+        menu.append("Exporter en SRT", "tr.srt")
+        menu.append("Exporter en VTT", "tr.vtt")
+        menu.append("Supprimer", "tr.delete")
+        menu_btn.set_menu_model(menu)
+
+        actions = Gio.SimpleActionGroup()
+        act = Gio.SimpleAction(name="open")
+        act.connect("activate", lambda *_a, tr=t: self.on_open_transcript_clicked(tr))
+        actions.add_action(act)
+        act = Gio.SimpleAction(name="srt")
+        act.connect("activate", lambda *_a, tr=t: self.on_export_srt(tr))
+        actions.add_action(act)
+        act = Gio.SimpleAction(name="vtt")
+        act.connect("activate", lambda *_a, tr=t: self.on_export_vtt(tr))
+        actions.add_action(act)
+        act = Gio.SimpleAction(name="delete")
+        act.connect("activate", lambda *_a, tr=t: self.on_delete_transcript_clicked(tr))
+        actions.add_action(act)
+        menu_btn.insert_action_group("tr", actions)
+
         box.append(icon)
         box.append(info_box)
-        box.append(Gtk.Box())
+        box.append(menu_btn)
 
-        return Gtk.ListBoxRow(child=box, activatable=False)
+        row = Gtk.ListBoxRow(child=box, activatable=True)
+        row.transcript = t
+        return row
 
-    def on_transcript_selected(self, list_box, row):
+    def _on_transcript_activated(self, list_box, row):
+        """Double-clic sur une transcription : ouverture."""
+        transcript = getattr(row, "transcript", None)
+        if transcript:
+            self.on_open_transcript_clicked(transcript)
+
+    def _selected_transcript(self) -> Optional[dict]:
+        """Transcription de la ligne sélectionnée (pour les raccourcis clavier)."""
+        row = self.transcripts_list.get_selected_row()
         if row is None:
-            self.open_btn.set_sensitive(False)
-            self.delete_btn.set_sensitive(False)
-            self.export_srt_btn.set_sensitive(False)
-            self.export_vtt_btn.set_sensitive(False)
-            self.selected_transcript = None
-            return
-
-        # Retrouver la transcription correspondante
-        idx = row.get_index()
-        query = self.search_entry.get_text()
-        if not query:
-            transcripts = self.all_transcripts
-        else:
-            query_lower = query.lower()
-            transcripts = []
-            for t in self.all_transcripts:
-                if query_lower in t["name"].lower():
-                    transcripts.append(t)
-                    continue
-                try:
-                    content = t["path"].read_text(encoding="utf-8").lower()
-                    if query_lower in content:
-                        transcripts.append(t)
-                except Exception:
-                    continue
-
-        if 0 <= idx < len(transcripts):
-            self.selected_transcript = transcripts[idx]
-            self.open_btn.set_sensitive(True)
-            self.delete_btn.set_sensitive(True)
-            self.export_srt_btn.set_sensitive(True)
-            self.export_vtt_btn.set_sensitive(True)
+            self.toast("Sélectionnez d'abord une transcription.")
+            return None
+        return getattr(row, "transcript", None)
 
     # ========================================================================
     # EXPORT SRT/VTT DEPUIS UNE TRANSCRIPTION EXISTANTE
     # ========================================================================
 
-    def on_export_srt(self, button=None):
-        if not self.selected_transcript:
+    def on_export_srt(self, transcript: dict):
+        if not transcript:
             return
-        self._export_subtitle("srt")
+        self._export_subtitle(transcript, "srt")
 
-    def on_export_vtt(self, button=None):
-        if not self.selected_transcript:
+    def on_export_vtt(self, transcript: dict):
+        if not transcript:
             return
-        self._export_subtitle("vtt")
+        self._export_subtitle(transcript, "vtt")
 
-    def _export_subtitle(self, fmt: str):
+    def _export_subtitle(self, transcript: dict, fmt: str):
         """Parse un .md de transcription et exporte en SRT ou VTT."""
-        path = self.selected_transcript["path"]
+        path = transcript["path"]
         content = path.read_text(encoding="utf-8")
 
         # Parser les segments [HH:MM:SS - HH:MM:SS] ou [HH:MM:SS] **Speaker**:
@@ -1174,11 +1124,12 @@ class VoxCastWindow:
     # ACTIONS TRANSCRIPTIONS
     # ========================================================================
 
-    def on_open_transcript_clicked(self, button=None):
-        if not self.selected_transcript:
+    def on_open_transcript_clicked(self, transcript: Optional[dict] = None):
+        transcript = transcript or self._selected_transcript()
+        if not transcript:
             return
         try:
-            subprocess.run(["xdg-open", str(self.selected_transcript["path"])], check=True)
+            subprocess.run(["xdg-open", str(transcript["path"])], check=True)
         except Exception as e:
             self.toast(f"Impossible d'ouvrir : {e}", "error")
 
@@ -1188,11 +1139,12 @@ class VoxCastWindow:
         except Exception as e:
             self.toast(f"Impossible d'ouvrir : {e}", "error")
 
-    def on_delete_transcript_clicked(self, button=None):
-        if not self.selected_transcript:
+    def on_delete_transcript_clicked(self, transcript: Optional[dict] = None):
+        transcript = transcript or self._selected_transcript()
+        if not transcript:
             return
-        name = self.selected_transcript["name"]
-        path = self.selected_transcript["path"]
+        name = transcript["name"]
+        path = transcript["path"]
 
         dialog = Adw.MessageDialog(
             transient_for=self.window,
@@ -1279,9 +1231,8 @@ class VoxCastWindow:
     # ========================================================================
 
     def _on_source_changed(self):
-        """Gère le changement de source : active le bouton et lance l'estimation."""
+        """Gère le changement de source : lance l'estimation durée/coût."""
         url = self.url_entry.get_text().strip()
-        self.add_queue_btn.set_sensitive(bool(url) and not self.running)
         self._check_source_type()
 
     def _ensure_api_key(self, on_success) -> bool:
@@ -1343,8 +1294,6 @@ class VoxCastWindow:
     def toast(self, message: str, kind: str = "info", timeout: int = 4):
         """Affiche un retour utilisateur non bloquant sous forme de toast."""
         toast = Adw.Toast(title=message, timeout=timeout)
-        if kind == "error":
-            toast.add_css_class("error")
         self.toast_overlay.add_toast(toast)
 
     def update_status(self, status: str, color: str = None):
