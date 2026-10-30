@@ -199,6 +199,9 @@ TRANSLATIONS = {
         _("Rechercher (nom ou contenu)..."): "Search (name or content)...",
         _("Ouvrir le dossier des transcriptions"): "Open transcripts folder",
         _("Aucune transcription"): "No transcripts yet",
+        _("Dossier introuvable"): "Folder not found",
+        _("Le dossier des transcriptions configuré n'existe pas :\n{path}\nVérifiez-le dans les Paramètres (⚙)."):
+            "The configured transcripts folder does not exist:\n{path}\nCheck it in Settings (⚙).",
         _("Les fichiers Markdown apparaîtront ici après le traitement de la file."):
             "Markdown files will appear here once the queue is processed.",
         _("Ouvrir le dossier"): "Open folder",
@@ -989,6 +992,7 @@ class VoxCastWindow:
             title=_("Aucune transcription"),
             description=_("Les fichiers Markdown apparaîtront ici après le traitement de la file."),
         )
+        self.empty_page = empty_page
         open_folder_btn = Gtk.Button(label=_("Ouvrir le dossier"))
         open_folder_btn.connect("clicked", self.on_open_folder_clicked)
         empty_page.set_child(open_folder_btn)
@@ -2145,6 +2149,19 @@ class VoxCastWindow:
 
         if not transcripts:
             if not self.all_transcripts:
+                # dossier configuré introuvable -> message explicite avec le chemin
+                if not self.transcripts_dir.exists():
+                    self.empty_page.set_icon_name("dialog-warning-symbolic")
+                    self.empty_page.set_title(_("Dossier introuvable"))
+                    self.empty_page.set_description(
+                        _("Le dossier des transcriptions configuré n'existe pas :\n{path}\n"
+                          "Vérifiez-le dans les Paramètres (⚙).").format(
+                              path=self.transcripts_dir))
+                else:
+                    self.empty_page.set_icon_name("folder-documents-symbolic")
+                    self.empty_page.set_title(_("Aucune transcription"))
+                    self.empty_page.set_description(
+                        _("Les fichiers Markdown apparaîtront ici après le traitement de la file."))
                 self.transcripts_stack.set_visible_child_name("empty")
             else:
                 self.transcripts_stack.set_visible_child_name("no-results")
