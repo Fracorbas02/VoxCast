@@ -1360,7 +1360,8 @@ class VoxCastWindow:
         }
 
     def _probe_duration(self, source: str, is_local: bool) -> Optional[float]:
-        """Durée audio en secondes (sonde ffprobe ou métadonnées YouTube cachées)."""
+        """Durée audio en secondes (sonde ffprobe ou métadonnées YouTube cachées).
+        Peut faire un appel réseau : à appeler depuis un thread."""
         try:
             if is_local:
                 return vtt.get_audio_duration_seconds(Path(source))
@@ -1368,6 +1369,14 @@ class VoxCastWindow:
             return info.get("duration") or None
         except Exception:
             return None
+
+    def _apply_probe_duration(self, item: QueueItem, duration: Optional[float]):
+        """Applique la durée sondée (arrive en async) : ETA + persistance."""
+        item.duration = duration
+        self._save_queue()
+        if self.running:
+            self._update_global_progress()
+        return False
 
     def on_add_to_queue(self, button=None):
         """Ajoute l'élément courant à la file d'attente."""
@@ -1391,9 +1400,18 @@ class VoxCastWindow:
         options = self._collect_options()
 
         item = QueueItem(source=source, is_local=is_local, options=options)
-        item.duration = self._probe_duration(source, is_local)
         self.queue.append(item)
         self._refresh_queue_list()
+
+        # sonde de durée en arrière-plan (réseau yt-dlp pour les URLs) :
+        # ne jamais bloquer le thread GTK au clic « Ajouter »
+        def probe():
+            try:
+                d = self._probe_duration(source, is_local)
+            except Exception:
+                d = None
+            GLib.idle_add(self._apply_probe_duration, item, d)
+        threading.Thread(target=probe, daemon=True).start()
 
         # Réinitialiser les champs
         self.url_entry.set_text("")
@@ -2121,7 +2139,17 @@ class VoxCastWindow:
                               "durées, coûts et tokens ici.")))
 
     def on_search_changed(self, entry):
-        self._filter_transcripts(entry.get_text())
+        # debounce 300 ms : la recherche plein texte lit tous les .md,
+        # inutile de la relancer à chaque frappe
+        if getattr(self, "_search_debounce_id", None) is not None:
+            GLib.source_remove(self._search_debounce_id)
+        self._search_debounce_id = GLib.timeout_add(
+            300, self._launch_search, entry.get_text())
+
+    def _launch_search(self, query: str):
+        self._search_debounce_id = None
+        self._filter_transcripts(query)
+        return False
 
     def _filter_transcripts(self, query: str):
         """Filtre la liste par nom ou par contenu."""
@@ -2773,6 +2801,9 @@ class VoxCastWindow:
         return self.transcripts_dir / ".summaries" / f"{transcript['name']}.mp3"
 
     def _on_summary_close(self, dialog):
+        t = getattr(dialog, "_tts", None)
+        if t is not None:
+            t["closed"] = True  # la génération TTS en cours ne touchera plus aux widgets
         self._tts_stop(dialog)
         return False  # laisse la fenêtre se fermer
 
@@ -2842,10 +2873,13 @@ class VoxCastWindow:
         t = dialog._tts
         t["generating"] = False
         if not ok:
-            t["btn"].set_icon_name("media-playback-start-symbolic")
             self.toast(f"TTS impossible : {err}", "error", 6)
+            if not t.get("closed"):
+                t["btn"].set_icon_name("media-playback-start-symbolic")
             return False
         self.refresh_transcripts_list()  # fait apparaître la pastille « TTS »
+        if t.get("closed"):
+            return False  # fenêtre fermée entre-temps : le mp3 est bien sauvé
         self._tts_play(dialog)
         return False
 
@@ -2975,19 +3009,20 @@ class VoxCastWindow:
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
-        self._chat_scroll = Gtk.ScrolledWindow(
+        # widgets propres à CETTE fenêtre de chat (pas sur self : plusieurs
+        # chats peuvent être ouverts en même temps)
+        chat_scroll = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER,
             vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
             vexpand=True,
         )
-        self._chat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self._chat_box.set_margin_top(16)
-        self._chat_box.set_margin_bottom(16)
-        self._chat_box.set_margin_start(16)
-        self._chat_box.set_margin_end(16)
-        self._chat_scroll.set_child(Adw.Clamp(maximum_size=700,
-                                              child=self._chat_box))
-        content.append(self._chat_scroll)
+        chat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        chat_box.set_margin_top(16)
+        chat_box.set_margin_bottom(16)
+        chat_box.set_margin_start(16)
+        chat_box.set_margin_end(16)
+        chat_scroll.set_child(Adw.Clamp(maximum_size=700, child=chat_box))
+        content.append(chat_scroll)
 
         status = Gtk.Label(label="", halign=Gtk.Align.START,
                            margin_start=14, css_classes=["caption", "dim-label"])
@@ -3012,18 +3047,31 @@ class VoxCastWindow:
 
         state = {"history": self._load_chat_history(transcript), "busy": False,
                  "cancel": False, "started": 0.0, "last_msg": "",
-                 "watch_id": None}
+                 "watch_id": None, "closed": False}
         dialog._chat_state = state
         dialog._chat_transcript = transcript
         dialog._chat_status = status
         dialog._chat_entry = entry
+        dialog._chat_box = chat_box
+        dialog._chat_scroll = chat_scroll
+
+        def on_close_request(_dlg):
+            # annule proprement une éventuelle réponse en cours
+            state["closed"] = True
+            state["cancel"] = True
+            if state["watch_id"] is not None:
+                GLib.source_remove(state["watch_id"])
+                state["watch_id"] = None
+            return False  # laisse la fenêtre se fermer
+
+        dialog.connect("close-request", on_close_request)
 
         for m in state["history"]:
-            self._add_chat_bubble(self._chat_box, m.get("role", "assistant"),
+            self._add_chat_bubble(chat_box, m.get("role", "assistant"),
                                   m.get("content", ""))
 
         def scroll_bottom():
-            adj = self._chat_scroll.get_vadjustment()
+            adj = chat_scroll.get_vadjustment()
             adj.set_value(adj.get_upper() - adj.get_page_size())
 
         def send(*_a):
@@ -3035,7 +3083,7 @@ class VoxCastWindow:
             state["cancel"] = False
             state["started"] = time.monotonic()
             state["last_msg"] = _("Réflexion...")
-            self._add_chat_bubble(self._chat_box, "user", q)
+            self._add_chat_bubble(chat_box, "user", q)
             state["history"].append({"role": "user", "content": q})
             status.set_label(state["last_msg"])
             GLib.idle_add(scroll_bottom)
@@ -3074,6 +3122,8 @@ class VoxCastWindow:
         le temps écoulé)."""
         state = dialog._chat_state
         state["last_msg"] = msg
+        if state.get("closed"):
+            return False
         if state["busy"] and state["started"]:
             elapsed = time.monotonic() - state["started"]
             dialog._chat_status.set_label(f"{msg} — {int(elapsed)}s")
@@ -3085,7 +3135,7 @@ class VoxCastWindow:
         """Toutes les 5s pendant une réponse : affiche le temps écoulé et
         annule (avec alerte) si le backend ne répond plus depuis trop longtemps."""
         state = dialog._chat_state
-        if not state["busy"]:
+        if state.get("closed") or not state["busy"]:
             state["watch_id"] = None
             return False
         elapsed = time.monotonic() - state["started"]
@@ -3110,10 +3160,12 @@ class VoxCastWindow:
             state["watch_id"] = None
         state["busy"] = False
         state["history"] = history
-        self._add_chat_bubble(self._chat_box, "assistant", answer)
-        dialog._chat_status.set_label("")
         self._save_chat_history(dialog._chat_transcript, history)
-        adj = self._chat_scroll.get_vadjustment()
+        if state.get("closed"):
+            return False  # fenêtre fermée entre-temps : on ne touche plus aux widgets
+        self._add_chat_bubble(dialog._chat_box, "assistant", answer)
+        dialog._chat_status.set_label("")
+        adj = dialog._chat_scroll.get_vadjustment()
         adj.set_value(adj.get_upper() - adj.get_page_size())
         return False
 
@@ -3124,6 +3176,8 @@ class VoxCastWindow:
             state["watch_id"] = None
         was_busy = state["busy"]
         state["busy"] = False
+        if state.get("closed"):
+            return False  # fenêtre fermée : on garde juste l'état cohérent
         dialog._chat_status.set_label(f"{_('Erreur')} : {message}")
         if was_busy:
             self.toast(f"Chat impossible : {message}", "error", 8)
@@ -3440,8 +3494,12 @@ a {{ color: #3584e4; }}
         if response == "delete":
             try:
                 path.unlink()
-                # Supprime aussi le résumé IA associé s'il existe
-                self._summary_path({"name": path.stem}).unlink(missing_ok=True)
+                # Supprime aussi les artefacts associés (.summaries/<nom>.*)
+                sdir = self.transcripts_dir / ".summaries"
+                for ext in (".md", ".mp3", ".chat.json"):
+                    (sdir / f"{path.stem}{ext}").unlink(missing_ok=True)
+                for ext in (".srt", ".vtt", ".html", ".pdf"):
+                    path.with_suffix(ext).unlink(missing_ok=True)
                 self.toast(f"Supprimé : {path.stem}")
                 self.refresh_transcripts_list()
             except Exception as e:
@@ -3532,6 +3590,14 @@ a {{ color: #3584e4; }}
         tts_group.add(tts_row)
         page.add(tts_group)
 
+        dialog_closed = {"v": False}
+
+        def _mark_settings_closed(_dlg):
+            dialog_closed["v"] = True
+            return False  # laisse le dialogue se fermer
+
+        dialog.connect("close-request", _mark_settings_closed)
+
         def fill_voices():
             if not self.api_key:
                 return
@@ -3540,6 +3606,8 @@ a {{ color: #3584e4; }}
             except Exception:
                 return
             def apply():
+                if dialog_closed["v"]:
+                    return False  # dialogue fermé entre-temps
                 current = self.tts_dropdown.get_selected()
                 cur_slug = (tts_row._voice_slugs[current]
                             if current < len(tts_row._voice_slugs) else "")
@@ -3730,6 +3798,10 @@ a {{ color: #3584e4; }}
         settings_path = APP_DIR / "settings.json"
         with open(settings_path, "w") as f:
             json.dump(settings, f, indent=2)
+        try:
+            os.chmod(settings_path, 0o600)  # contient la clé API
+        except OSError:
+            pass
 
     def load_settings(self):
         settings_path = APP_DIR / "settings.json"
