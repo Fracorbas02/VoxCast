@@ -2139,12 +2139,58 @@ class VoxCastWindow:
         output_group.add(output_row)
         page.add(output_group)
 
+        # Apparence : thème clair / sombre
+        theme_group = Adw.PreferencesGroup(title="Apparence")
+        theme_row = Adw.ActionRow(
+            title="Thème",
+            subtitle="Clair, sombre ou celui du système",
+        )
+        theme_model = Gtk.StringList()
+        for name in ["Système", "Clair", "Sombre"]:
+            theme_model.append(name)
+        theme_idx = {"default": 0, "light": 1, "dark": 2}[self.color_scheme]
+        self.theme_dropdown = Gtk.DropDown(
+            model=theme_model, selected=theme_idx, valign=Gtk.Align.CENTER)
+        self.theme_dropdown.connect("notify::selected", self.on_theme_changed)
+        theme_row.add_suffix(self.theme_dropdown)
+        theme_row.set_activatable_widget(self.theme_dropdown)
+        theme_group.add(theme_row)
+        page.add(theme_group)
+
+        # Traitement parallèle
+        proc_group = Adw.PreferencesGroup(title="Traitement")
+        workers_row = Adw.ActionRow(
+            title="Transcriptions en parallèle",
+            subtitle="Nombre d'éléments traités simultanément",
+        )
+        adjustment = Gtk.Adjustment(
+            value=self.max_workers, lower=1, upper=8, step_increment=1)
+        self.workers_spin = Gtk.SpinButton(
+            adjustment=adjustment, valign=Gtk.Align.CENTER)
+        self.workers_spin.connect("value-changed", self.on_workers_changed)
+        workers_row.add_suffix(self.workers_spin)
+        workers_row.set_activatable_widget(self.workers_spin)
+        proc_group.add(workers_row)
+        page.add(proc_group)
+
         dialog.add(page)
         dialog.present()
+
+    def on_theme_changed(self, dropdown, _param):
+        idx = dropdown.get_selected()
+        self.color_scheme = {0: "default", 1: "light", 2: "dark"}[idx]
+        self.save_settings()
+        self._apply_color_scheme()
+
+    def on_workers_changed(self, spin):
+        self.max_workers = max(1, int(spin.get_value()))
+        self.save_settings()
 
     def on_api_key_changed(self, row):
         self.api_key = row.get_text().strip()
         self.save_settings()
+        if hasattr(self, "api_banner"):
+            self.api_banner.set_revealed(not self.api_key)
 
     def on_browse_output(self, button, output_row):
         dialog = Gtk.FileChooserDialog(
@@ -2275,8 +2321,25 @@ class VoxCastWindow:
                 tdir = Path(settings.get("transcripts_dir", str(DEFAULT_TRANSCRIPTS_DIR)))
                 if tdir.parent.exists():
                     self.transcripts_dir = tdir
+                self.max_workers = int(settings.get("max_workers", 2))
+                self.color_scheme = settings.get("color_scheme", "default")
+                self.custom_models = settings.get("custom_models", []) or []
+                self.model_profile = settings.get("model_profile")
         except (FileNotFoundError, json.JSONDecodeError):
             pass
+
+    def _apply_color_scheme(self):
+        """Applique le thème clair/sombre choisi (Adw.StyleManager)."""
+        try:
+            manager = Adw.StyleManager.get_default()
+            if self.color_scheme == "light":
+                manager.set_color_scheme(Adw.ColorScheme.FORCE_LIGHT)
+            elif self.color_scheme == "dark":
+                manager.set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+            else:
+                manager.set_color_scheme(Adw.ColorScheme.DEFAULT)
+        except Exception as e:
+            self.log_message(f"Thème: {e}")
 
     def on_shutdown(self, app):
         self.cancelled = True
