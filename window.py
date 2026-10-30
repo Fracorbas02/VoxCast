@@ -743,7 +743,7 @@ class VoxCastWindow:
             ("cancel", ["<Control>q"], self.on_cancel_clicked),
             ("refresh", ["<Control>r"], self.refresh_transcripts_list),
             ("open", ["<Control>o"],
-             lambda: self.on_open_transcript_clicked(self._selected_transcript())),
+             lambda: self.on_preview_transcript(self._selected_transcript())),
             ("delete", ["<Control>d"],
              lambda: self.on_delete_transcript_clicked(self._selected_transcript())),
         ]
@@ -1391,35 +1391,48 @@ class VoxCastWindow:
         for row in list(self.transcripts_list):
             self.transcripts_list.remove(row)
 
+        summary_index = self._summaries_index()
         if not query:
-            transcripts = self.all_transcripts
+            transcripts = [dict(t, has_summary=t["name"] in summary_index)
+                           for t in self.all_transcripts]
         else:
             query_lower = query.lower()
             transcripts = []
             for t in self.all_transcripts:
                 # Recherche par nom
                 if query_lower in t["name"].lower():
-                    transcripts.append(t)
+                    match = dict(t)
+                    match["snippet"] = None
+                    match["has_summary"] = t["name"] in summary_index
+                    transcripts.append(match)
                     continue
-                # Recherche par contenu
+                # Recherche par contenu (avec extrait autour du match)
                 try:
-                    content = t["path"].read_text(encoding="utf-8").lower()
-                    if query_lower in content:
-                        transcripts.append(t)
+                    raw = t["path"].read_text(encoding="utf-8")
+                    content = raw.lower()
+                    idx = content.find(query_lower)
+                    if idx >= 0:
+                        match = dict(t)
+                        start = max(0, idx - 50)
+                        end = min(len(raw), idx + len(query) + 70)
+                        snippet = raw[start:end].replace("\n", " ").strip()
+                        if start > 0:
+                            snippet = "…" + snippet
+                        if end < len(raw):
+                            snippet = snippet + "…"
+                        match["snippet"] = snippet
+                        match["has_summary"] = t["name"] in summary_index
+                        transcripts.append(match)
                 except Exception:
                     continue
 
         if not transcripts:
-            label = "Aucune transcription" if not query else "Aucun résultat"
-            empty = Gtk.Label(
-                label=label,
-                halign=Gtk.Align.CENTER,
-                margin_top=10,
-                margin_bottom=10,
-            )
-            empty.add_css_class("dim-label")
-            self.transcripts_list.append(empty)
+            if not self.all_transcripts:
+                self.transcripts_stack.set_visible_child_name("empty")
+            else:
+                self.transcripts_stack.set_visible_child_name("no-results")
             return
+        self.transcripts_stack.set_visible_child_name("list")
 
         for t in transcripts:
             row = self._create_transcript_row(t)
@@ -1441,18 +1454,33 @@ class VoxCastWindow:
         return transcripts
 
     def _create_transcript_row(self, t: dict) -> Gtk.Widget:
-        box = Gtk.Box(spacing=10, halign=Gtk.Align.FILL, margin_top=6, margin_bottom=6)
-        icon = Gtk.Image(icon_name="text-x-generic-symbolic", pixel_size=24,
-                         valign=Gtk.Align.CENTER)
+        box = Gtk.Box(spacing=12, halign=Gtk.Align.FILL,
+                      margin_top=8, margin_bottom=8, margin_start=10, margin_end=10)
 
-        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        badge = Gtk.Box(css_classes=["icon-badge", "badge-accent"],
+                        valign=Gtk.Align.CENTER)
+        badge.append(Gtk.Image(icon_name="text-x-generic-symbolic", pixel_size=20))
+        box.append(badge)
+
+        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                           hexpand=True, valign=Gtk.Align.CENTER)
         name_label = Gtk.Label(
             label=t["name"],
             halign=Gtk.Align.START,
             ellipsize=Pango.EllipsizeMode.END,
             max_width_chars=50,
+            css_classes=["row-title"],
         )
-        name_label.add_css_class("title-4")
+
+        # Pastille « Résumé IA » quand un résumé persisté existe pour ce fichier
+        title_row = Gtk.Box(spacing=8, halign=Gtk.Align.START)
+        title_row.append(name_label)
+        if t.get("has_summary"):
+            title_row.append(Gtk.Label(
+                label="Résumé IA",
+                halign=Gtk.Align.START,
+                css_classes=["status-pill", "pill-summary"],
+            ))
 
         date = datetime.fromtimestamp(t["modified"]).strftime("%Y-%m-%d %H:%M")
         size = self._format_size(t["size"])
@@ -1460,26 +1488,48 @@ class VoxCastWindow:
             label=f"{size} • {date}",
             halign=Gtk.Align.START,
             ellipsize=Pango.EllipsizeMode.END,
+            css_classes=["caption", "dim-label"],
         )
-        details.add_css_class("dim-label")
 
-        info_box.append(name_label)
+        info_box.append(title_row)
         info_box.append(details)
 
-        # Menu par ligne (⋮) : ouvrir, exporter, supprimer
+        # Extrait du match quand on fait une recherche plein texte
+        snippet = t.get("snippet")
+        if snippet:
+            query = self.search_entry.get_text()
+            snippet_label = Gtk.Label(
+                halign=Gtk.Align.START,
+                ellipsize=Pango.EllipsizeMode.END,
+                max_width_chars=80,
+                use_markup=True,
+                label=self._highlight_snippet(snippet, query),
+                css_classes=["caption", "dim-label"],
+            )
+            info_box.append(snippet_label)
+
+        # Menu par ligne (⋮) : aperçu, résumé, ouvrir, exporter, supprimer
         menu_btn = Gtk.MenuButton(
             icon_name="view-more-symbolic",
             valign=Gtk.Align.CENTER,
             tooltip_text="Actions",
         )
         menu = Gio.Menu()
-        menu.append("Ouvrir", "tr.open")
+        menu.append("Aperçu dans l'app", "tr.preview")
+        menu.append("Résumé IA", "tr.summary")
+        menu.append("Ouvrir (externe)", "tr.open")
         menu.append("Exporter en SRT", "tr.srt")
         menu.append("Exporter en VTT", "tr.vtt")
         menu.append("Supprimer", "tr.delete")
         menu_btn.set_menu_model(menu)
 
         actions = Gio.SimpleActionGroup()
+        act = Gio.SimpleAction(name="preview")
+        act.connect("activate", lambda *_a, tr=t: self.on_preview_transcript(tr))
+        actions.add_action(act)
+        act = Gio.SimpleAction(name="summary")
+        act.connect("activate", lambda *_a, tr=t: self.on_summarize_clicked(tr))
+        actions.add_action(act)
         act = Gio.SimpleAction(name="open")
         act.connect("activate", lambda *_a, tr=t: self.on_open_transcript_clicked(tr))
         actions.add_action(act)
@@ -1502,10 +1552,18 @@ class VoxCastWindow:
         return row
 
     def _on_transcript_activated(self, list_box, row):
-        """Double-clic sur une transcription : ouverture."""
+        """Double-clic sur une transcription : aperçu dans l'app."""
         transcript = getattr(row, "transcript", None)
         if transcript:
-            self.on_open_transcript_clicked(transcript)
+            self.on_preview_transcript(transcript)
+
+    def _highlight_snippet(self, snippet: str, query: str) -> str:
+        """Échappe le snippet et met en gras la requête (insensible à la casse)."""
+        escaped = html.escape(snippet)
+        if not query:
+            return escaped
+        pattern = re.compile(re.escape(html.escape(query)), re.IGNORECASE)
+        return pattern.sub(lambda m: f"<b>{m.group(0)}</b>", escaped)
 
     def _selected_transcript(self) -> Optional[dict]:
         """Transcription de la ligne sélectionnée (pour les raccourcis clavier)."""
@@ -1514,6 +1572,390 @@ class VoxCastWindow:
             self.toast("Sélectionnez d'abord une transcription.")
             return None
         return getattr(row, "transcript", None)
+
+    # ========================================================================
+    # APERÇU IN-APP (Markdown rendu) + RÉSUMÉ IA
+    # ========================================================================
+
+    def on_preview_transcript(self, transcript: Optional[dict] = None):
+        """Ouvre l'aperçu d'une transcription dans une fenêtre in-app."""
+        transcript = transcript or self._selected_transcript()
+        if not transcript:
+            return
+        try:
+            md_text = transcript["path"].read_text(encoding="utf-8")
+        except Exception as e:
+            self.toast(f"Impossible de lire : {e}", "error")
+            return
+
+        dialog = Adw.Window(
+            transient_for=self.window,
+            modal=False,
+            title=transcript["name"],
+            default_width=780,
+            default_height=680,
+        )
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Gtk.Label(
+            label=transcript["name"], ellipsize=Pango.EllipsizeMode.END,
+            max_width_chars=40, css_classes=["title-4"]))
+        copy_btn = Gtk.Button(icon_name="edit-copy-symbolic",
+                              tooltip_text="Copier le Markdown brut")
+        copy_btn.connect("clicked", lambda *_: self._copy_to_clipboard(md_text))
+        header.pack_end(copy_btn)
+        summary_btn = Gtk.Button(label="Résumé IA", css_classes=["suggested-action"])
+        summary_btn.connect("clicked",
+                            lambda *_: self.on_summarize_clicked(transcript))
+        header.pack_end(summary_btn)
+        toolbar.add_top_bar(header)
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        inner.set_margin_top(18)
+        inner.set_margin_bottom(24)
+        inner.set_margin_start(24)
+        inner.set_margin_end(24)
+
+        # Table des matières des chapitres (si la vidéo en définit)
+        chapters = self._extract_chapters(md_text)
+        if chapters:
+            source_url = self._extract_source_url(md_text)
+            toc = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                          css_classes=["status-bar"])
+            toc.append(Gtk.Label(label="Chapitres", halign=Gtk.Align.START,
+                                 margin_bottom=4, css_classes=["heading"]))
+            for secs, chap_title in chapters:
+                btn = Gtk.Button(halign=Gtk.Align.START, css_classes=["flat"])
+                btn.set_label(f"{vtt.format_timestamp(secs)} — {chap_title}")
+                btn.connect("clicked", lambda *_b, s=secs:
+                            self._open_source_at(source_url, s))
+                toc.append(btn)
+            inner.append(toc)
+
+        inner.append(self._build_md_view(md_text))
+
+        scrolled = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            child=Adw.Clamp(maximum_size=720, child=inner),
+        )
+        scrolled.set_vexpand(True)
+        toolbar.set_content(scrolled)
+        dialog.set_content(toolbar)
+        dialog.present()
+
+    def _extract_chapters(self, md_text: str) -> list[tuple[float, str]]:
+        """Extrait la section '## Chapitres' : [(secondes, titre), ...]."""
+        chapters = []
+        in_section = False
+        for line in md_text.split("\n"):
+            if line.startswith("## "):
+                in_section = line.strip() == "## Chapitres"
+                continue
+            if in_section:
+                m = re.match(r"-\s*\[(\d{2}:\d{2}:\d{2})\]\s*(.*)", line.strip())
+                if m:
+                    chapters.append((vtt.parse_timestamp_arg(m.group(1)),
+                                     m.group(2).strip()))
+        return chapters
+
+    def _extract_source_url(self, md_text: str) -> Optional[str]:
+        """Récupère l'URL source écrite dans les métadonnées du .md."""
+        m = re.search(r"\*\*Source\*\*\s*:\s*(\S+)", md_text)
+        return m.group(1) if m else None
+
+    def _open_source_at(self, source_url: Optional[str], seconds: float):
+        """Ouvre la vidéo source au timestamp donné (si c'est une URL)."""
+        if not source_url or not source_url.startswith("http"):
+            self.toast("Pas de source vidéo associée à cette transcription.")
+            return
+        sep = "&" if "?" in source_url else "?"
+        url = f"{source_url}{sep}t={int(seconds)}"
+        threading.Thread(
+            target=lambda: subprocess.run(["xdg-open", url]),
+            daemon=True,
+        ).start()
+
+    def _md_inline(self, text: str) -> str:
+        """Convertit le Markdown inline en markup Pango (échappé)."""
+        s = html.escape(text)
+        s = re.sub(r"`([^`]+)`", r"<tt>\1</tt>", s)
+        s = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", s)
+        s = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", s)
+        s = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", s)  # images ignorées
+        s = re.sub(r"\[([^\]]+)\]\([^)]*\)",
+                   r'<span underline="single" foreground="#ff7a18">\1</span>', s)
+        return s
+
+    def _build_md_view(self, md_text: str) -> Gtk.Widget:
+        """Rendu simple du Markdown en widgets GTK (titres, listes, code...)."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                      halign=Gtk.Align.FILL)
+
+        def add_markup(markup, css_classes=None):
+            label = Gtk.Label(halign=Gtk.Align.START, wrap=True, xalign=0,
+                              selectable=True, use_markup=True)
+            label.set_markup(markup)
+            if css_classes:
+                label.set_css_classes(css_classes)
+            box.append(label)
+
+        def add_text(text, css_classes=None):
+            label = Gtk.Label(halign=Gtk.Align.START, wrap=True, xalign=0,
+                              selectable=True)
+            label.set_label(text)
+            if css_classes:
+                label.set_css_classes(css_classes)
+            box.append(label)
+
+        in_code = False
+        code_lines: list[str] = []
+        for line in md_text.split("\n"):
+            if line.strip().startswith("```"):
+                if in_code:
+                    add_text("\n".join(code_lines), css_classes=["md-code"])
+                    code_lines = []
+                    in_code = False
+                else:
+                    in_code = True
+                continue
+            if in_code:
+                code_lines.append(line)
+                continue
+
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if set(stripped) == {"-"} and len(stripped) >= 3:
+                sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+                sep.set_margin_top(6)
+                sep.set_margin_bottom(6)
+                box.append(sep)
+            elif stripped.startswith("### "):
+                add_markup(self._md_inline(stripped[4:]),
+                           ["md-heading", "title-4"])
+            elif stripped.startswith("## "):
+                add_markup(self._md_inline(stripped[3:]),
+                           ["md-heading", "title-3"])
+            elif stripped.startswith("# "):
+                add_markup(self._md_inline(stripped[2:]),
+                           ["md-heading", "title-2"])
+            elif stripped.startswith("> "):
+                add_markup(f"<i>{self._md_inline(stripped[2:])}</i>",
+                           ["dim-label"])
+            elif re.match(r"^[-*+]\s+", stripped):
+                add_markup("•  " + self._md_inline(
+                    re.sub(r"^[-*+]\s+", "", stripped)))
+            else:
+                add_markup(self._md_inline(stripped))
+
+        if in_code and code_lines:
+            add_text("\n".join(code_lines), css_classes=["md-code"])
+        return box
+
+    # ------------------------------------------------------------------
+    # Résumé IA (Mistral Large, rendu in-app)
+    # ------------------------------------------------------------------
+
+    def on_summarize_clicked(self, transcript: Optional[dict] = None):
+        """
+        Ouvre le résumé IA s'il est déjà persisté (et à jour), sinon le génère
+        une seule fois puis l'ouvre. Un résumé en cours bloque la régénération.
+        """
+        transcript = transcript or self._selected_transcript()
+        if not transcript:
+            return
+        if transcript["name"] in self._summaries_index():
+            md = self._load_summary(transcript)
+            if md is not None:
+                self._show_summary_window(transcript, md)
+                return
+        if transcript["name"] in self._summaries_in_flight:
+            self.toast("Résumé IA déjà en cours de génération…")
+            return
+        self._ensure_api_key(lambda: self._start_summary(transcript))
+
+    # ------------------------------------------------------------------
+    # Persistance des résumés IA (transcripts/.summaries/<nom>.md)
+    # ------------------------------------------------------------------
+
+    def _summary_path(self, transcript: dict) -> Path:
+        return self.transcripts_dir / ".summaries" / f"{transcript['name']}.md"
+
+    def _summaries_index(self) -> set[str]:
+        """Noms des transcriptions dont le résumé IA persisté est à jour
+        (marqueur mtime/taille comparé au fichier source)."""
+        index: set[str] = set()
+        sdir = self.transcripts_dir / ".summaries"
+        if not sdir.exists():
+            return index
+        current = {}
+        for t in self.all_transcripts:
+            try:
+                st = t["path"].stat()
+                current[t["name"]] = (st.st_mtime, st.st_size)
+            except Exception:
+                pass
+        for f in sdir.glob("*.md"):
+            name = f.stem
+            if name not in current:
+                continue
+            try:
+                with f.open(encoding="utf-8") as fh:
+                    first = fh.readline()
+            except Exception:
+                continue
+            m = re.match(
+                r"<!--\s*voxcast:summary\s+mtime=([\d.]+)\s+size=(\d+)\s*-->", first)
+            if m and (float(m.group(1)), int(m.group(2))) == current[name]:
+                index.add(name)
+        return index
+
+    def _load_summary(self, transcript: dict) -> Optional[str]:
+        """Charge le résumé persisté (sans la ligne de métadonnées)."""
+        try:
+            text = self._summary_path(transcript).read_text(encoding="utf-8")
+        except Exception:
+            return None
+        lines = text.split("\n")
+        if lines and lines[0].startswith("<!-- voxcast:summary"):
+            lines = lines[1:]
+        return "\n".join(lines).strip()
+
+    def _save_summary(self, transcript: dict, md: str):
+        """Persiste le résumé avec un marqueur de fraîcheur (mtime/taille source)."""
+        try:
+            st = transcript["path"].stat()
+            marker = (f"<!-- voxcast:summary mtime={st.st_mtime} "
+                      f"size={st.st_size} -->\n\n")
+            sdir = self.transcripts_dir / ".summaries"
+            sdir.mkdir(parents=True, exist_ok=True)
+            self._summary_path(transcript).write_text(marker + md, encoding="utf-8")
+        except Exception as e:
+            self.log_message(f"Sauvegarde résumé: {e}")
+
+    # ------------------------------------------------------------------
+    # Génération du résumé IA
+    # ------------------------------------------------------------------
+
+    def _start_summary(self, transcript: dict):
+        try:
+            text = transcript["path"].read_text(encoding="utf-8")
+        except Exception as e:
+            self.toast(f"Impossible de lire : {e}", "error")
+            return
+
+        name = transcript["name"]
+        self._summaries_in_flight.add(name)
+
+        dialog = Adw.Window(
+            transient_for=self.window,
+            modal=False,
+            title=f"Résumé IA — {name}",
+            default_width=780,
+            default_height=680,
+        )
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Gtk.Label(label="Résumé IA", css_classes=["title-4"]))
+        toolbar.add_top_bar(header)
+
+        loading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                          halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER,
+                          vexpand=True)
+        spinner = Adw.Spinner()
+        spinner.set_size_request(48, 48)
+        bar = Gtk.ProgressBar(css_classes=["voxcast-progress"],
+                              width_request=300, show_text=False)
+        status = Gtk.Label(
+            label="Analyse de la transcription (Mistral Large)...",
+            css_classes=["dim-label"])
+        loading.append(spinner)
+        loading.append(bar)
+        loading.append(status)
+        toolbar.set_content(loading)
+        dialog.set_content(toolbar)
+        dialog._summary_bar = bar
+        dialog._summary_status = status
+        dialog.present()
+
+        def work():
+            try:
+                md = vtt.summarize_text(
+                    self.api_key, text,
+                    progress_callback=lambda f, msg: GLib.idle_add(
+                        self._on_summary_progress, dialog, f, msg),
+                )
+                self._save_summary(transcript, md)
+                GLib.idle_add(self._on_summary_done, dialog, transcript, md)
+            except Exception as e:
+                GLib.idle_add(self.toast, f"Résumé impossible : {e}", "error", 6)
+                GLib.idle_add(self._summaries_in_flight.discard, name)
+                GLib.idle_add(dialog.close)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_summary_progress(self, dialog, frac: float, msg: str):
+        try:
+            dialog._summary_bar.set_fraction(frac)
+            dialog._summary_status.set_label(msg)
+        except Exception:
+            pass
+        return False
+
+    def _on_summary_done(self, dialog, transcript: dict, md: str):
+        """Résumé généré + persisté : notif, pastille, fenêtre de lecture."""
+        self._summaries_in_flight.discard(transcript["name"])
+        dialog.close()
+        self.toast("Résumé IA disponible", "success")
+        self._send_notification("Résumé IA disponible", transcript["name"])
+        self.refresh_transcripts_list()  # fait apparaître la pastille « Résumé IA »
+        self._show_summary_window(transcript, md)
+        return False
+
+    def _show_summary_window(self, transcript: dict, md: str):
+        """Fenêtre affichant un résumé IA (généré ou chargé depuis le cache)."""
+        self._last_summary = md
+
+        dialog = Adw.Window(
+            transient_for=self.window,
+            modal=False,
+            title=f"Résumé IA — {transcript['name']}",
+            default_width=780,
+            default_height=680,
+        )
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Gtk.Label(label="Résumé IA", css_classes=["title-4"]))
+        copy_btn = Gtk.Button(icon_name="edit-copy-symbolic",
+                              tooltip_text="Copier le résumé (Markdown)")
+        copy_btn.connect("clicked", lambda *_: self._copy_to_clipboard(md))
+        header.pack_end(copy_btn)
+        toolbar.add_top_bar(header)
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        inner.set_margin_top(18)
+        inner.set_margin_bottom(24)
+        inner.set_margin_start(24)
+        inner.set_margin_end(24)
+        inner.append(self._build_md_view(md))
+
+        scrolled = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            child=Adw.Clamp(maximum_size=720, child=inner),
+        )
+        scrolled.set_vexpand(True)
+        toolbar.set_content(scrolled)
+        dialog.set_content(toolbar)
+        dialog.present()
+
+    def _copy_to_clipboard(self, text: str):
+        try:
+            Gdk.Display.get_default().get_clipboard().set(text)
+            self.toast("Copié dans le presse-papiers", "success")
+        except Exception as e:
+            self.toast(f"Copie impossible : {e}", "error")
 
     # ========================================================================
     # EXPORT SRT/VTT DEPUIS UNE TRANSCRIPTION EXISTANTE
@@ -1661,6 +2103,8 @@ class VoxCastWindow:
         if response == "delete":
             try:
                 path.unlink()
+                # Supprime aussi le résumé IA associé s'il existe
+                self._summary_path({"name": path.stem}).unlink(missing_ok=True)
                 self.toast(f"Supprimé : {path.stem}")
                 self.refresh_transcripts_list()
             except Exception as e:

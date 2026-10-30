@@ -622,6 +622,129 @@ def transcribe_with_retry(
 
 
 # ---------------------------------------------------------------------------
+# Résumé IA (chat Mistral Large)
+# ---------------------------------------------------------------------------
+
+SUMMARY_SYSTEM_PROMPT = (
+    "Tu es un assistant de synthèse rigoureux et factuel. On te fournit la "
+    "transcription complète d'une vidéo ou d'un fichier audio (avec "
+    "éventuellement des timestamps [HH:MM:SS] et des locuteurs).\n\n"
+    "Rédige un résumé en français, en PROSE CONTINUE (paragraphes de 2 à 5 "
+    "phrases), sans introduction ni conclusion superflues.\n\n"
+    "Règles strictes :\n"
+    "- Privilégie des phrases complètes et denses ; n'emploie des listes à "
+    "puces que si elles sont vraiment indispensables, avec 5 puces maximum "
+    "dans tout le document.\n"
+    "- Rapporte les faits, chiffres, noms propres et décisions tels quels, "
+    "sans généralités ni remplissage.\n"
+    "- Conserve les timestamps [HH:MM:SS] entre parenthèses lorsqu'ils "
+    "aident à situer un point important.\n"
+    "- Structure attendue (titres Markdown, contenu en prose) :\n"
+    "## Résumé — un seul paragraphe de synthèse\n"
+    "## Points essentiels — prose, ou au plus 5 puces si vraiment nécessaire\n"
+    "## Citations remarquables — 2 à 4 courtes citations entre guillemets, "
+    "avec timestamp si disponible\n"
+    "## Actions à retenir — prose, ou puces uniquement pour des actions "
+    "concrètes, sinon 'Aucune'"
+)
+
+
+def chat_complete(
+    api_key: str,
+    messages: list[dict],
+    model: str = SUMMARY_MODEL,
+    max_tokens: int = 8192,
+    temperature: float = 0.3,
+) -> str:
+    """Appel chat completions Mistral (Mistral Large par défaut)."""
+    from mistralai.client import Mistral
+    client = Mistral(api_key=api_key)
+    response = client.chat.complete(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    return response.choices[0].message.content or ""
+
+
+def _split_for_summary(text: str, chunk_chars: int = SUMMARY_CHUNK_CHARS) -> list[str]:
+    """Découpe le texte en extraits de ~chunk_chars en coupant sur les paragraphes."""
+    chunks = []
+    current = ""
+    for para in text.split("\n\n"):
+        if current and len(current) + len(para) + 2 > chunk_chars:
+            chunks.append(current)
+            current = para
+        else:
+            current = f"{current}\n\n{para}" if current else para
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
+def summarize_text(api_key: str, text: str, progress_callback=None) -> str:
+    """
+    Résumé hiérarchique d'un texte long via Mistral Large (map-reduce).
+    progress_callback(fraction: float, message: str) si fourni.
+    Retourne le résumé en Markdown.
+    """
+    if not text.strip():
+        return "(Transcription vide)"
+
+    def _progress(frac, msg):
+        if progress_callback:
+            try:
+                progress_callback(frac, msg)
+            except Exception:
+                pass
+
+    chunks = _split_for_summary(text)
+    total = len(chunks)
+
+    if total == 1:
+        _progress(0.0, "Résumé en cours (Mistral Large)...")
+        result = chat_complete(api_key, [
+            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Transcription à résumer :\n\n{chunks[0]}"},
+        ], temperature=0.2)
+        _progress(1.0, "Résumé terminé")
+        return result
+
+    # Map : résumer chaque extrait, puis Reduce : synthèse globale
+    partials = []
+    for i, chunk in enumerate(chunks):
+        _progress(0.8 * i / total,
+                  f"Analyse de l'extrait {i + 1}/{total}...")
+        partial = chat_complete(
+            api_key,
+            [
+                {"role": "system", "content": (
+                    "Résume cet extrait de transcription en 2 à 4 phrases de "
+                    "prose factuelles en français (conserve les timestamps "
+                    "[HH:MM:SS] si présents). Pas de liste à puces.")},
+                {"role": "user", "content": chunk},
+            ],
+            max_tokens=2048,
+            temperature=0.2,
+        )
+        partials.append(partial)
+
+    _progress(0.9, "Synthèse finale...")
+    combined = "\n\n".join(
+        f"### Extrait {i + 1}\n{p}" for i, p in enumerate(partials)
+    )
+    result = chat_complete(api_key, [
+        {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            "Voici les résumés d'extraits d'une même transcription. "
+            "Produis le résumé global structuré demandé.\n\n" + combined)},
+    ], temperature=0.2)
+    _progress(1.0, "Résumé terminé")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Sauvegarde
 # ---------------------------------------------------------------------------
 
@@ -682,6 +805,16 @@ def save_transcription(
     if len(results) > 1:
         lines.append(f"**Chunks**      : {len(results)}")
     lines.extend(["", "---", ""])
+
+    # Chapitres YouTube (si la vidéo en définit)
+    chapters = video_info.get("chapters") or []
+    if chapters:
+        lines.extend(["## Chapitres", ""])
+        for ch in chapters:
+            start = ch.get("start", 0) or 0
+            title = (ch.get("title") or "").strip() or "Chapitre"
+            lines.append(f"- [{format_timestamp(start)}] {title}")
+        lines.extend(["", "---", ""])
 
     for result, offset in results:
         segments = result.get("segments", [])
