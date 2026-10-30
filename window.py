@@ -75,15 +75,177 @@ STATUS_DONE = "done"
 STATUS_ERROR = "error"
 STATUS_CANCELLED = "cancelled"
 
-STATUS_LABELS = {
-    STATUS_PENDING: "En attente",
-    STATUS_RUNNING: "En cours",
-    STATUS_DONE: "Terminé",
-    STATUS_ERROR: "Erreur",
-    STATUS_CANCELLED: "Annulé",
-}
+STATUS_KEYS = [STATUS_PENDING, STATUS_RUNNING, STATUS_DONE, STATUS_ERROR,
+               STATUS_CANCELLED]
 
-PILL_CLASSES = [f"pill-{s}" for s in STATUS_LABELS]
+
+def status_label(status: str) -> str:
+    """Libellé traduit d'un statut (évalué à la volée selon la langue)."""
+    return {
+        STATUS_PENDING: _("En attente"),
+        STATUS_RUNNING: _("En cours"),
+        STATUS_DONE: _("Terminé"),
+        STATUS_ERROR: _("Erreur"),
+        STATUS_CANCELLED: _("Annulé"),
+    }.get(status, status)
+
+
+PILL_CLASSES = [f"pill-{s}" for s in STATUS_KEYS]
+
+# ============================================================================
+# INTERNATIONALISATION (FR / EN)
+# ============================================================================
+LANG = "fr"
+
+
+def _(s: str) -> str:
+    """Traduit une chaîne selon la langue courante (FR par défaut).
+    Utilise globals() car TRANSLATIONS est remplie après cette définition."""
+    return globals().get("TRANSLATIONS", {}).get(LANG, {}).get(s, s)
+
+
+TRANSLATIONS = {
+    "en": {
+        _("Transcrire"): "Transcribe",
+        _("Bibliothèque"): "Library",
+        "Stats": "Stats",
+        "VoxCast": "VoxCast",
+        _("Transcrivez vos vidéos et fichiers audio en Markdown — propulsé par Voxtral."):
+            "Transcribe your videos and audio files to Markdown — powered by Voxtral.",
+        _("Nouvelle transcription"): "New transcription",
+        _("URL YouTube ou glissez un fichier audio ici"):
+            "YouTube URL or drop an audio file here",
+        _("Parcourir un fichier audio"): "Browse for an audio file",
+        _("Ajouter"): "Add",
+        _("Options avancées"): "Advanced options",
+        _("Nom de sortie (auto si vide)"): "Output name (auto if empty)",
+        _("Modèle de transcription"): "Transcription model",
+        _("Preset Mistral ou API perso (compatible /v1/audio/transcriptions)"):
+            "Mistral preset or custom API (compatible /v1/audio/transcriptions)",
+        _("Gérer les modèles personnalisés"): "Manage custom models",
+        _("Langue"): "Language",
+        _("Forcer la langue améliore la précision"): "Forcing the language improves accuracy",
+        _("Timestamps"): _("Timestamps"),
+        _("Inclure les horaires dans la sortie"): "Include timestamps in the output",
+        _("Diarisation"): "Speaker diarization",
+        _("Identifier les speakers"): "Identify speakers",
+        _("Garder l'audio"): "Keep audio",
+        _("Conserver le MP3 téléchargé"): "Keep the downloaded MP3",
+        _("Segment"): _("Segment"),
+        _("Transcrire seulement une partie (HH:MM:SS)"): "Transcribe only a part (HH:MM:SS)",
+        _("Context bias (termes, espaces, max 100)"): "Context bias (terms, spaces, max 100)",
+        _("Exporter en SRT"): "Export as SRT",
+        _("Sous-titres SubRip"): "SubRip subtitles",
+        _("Exporter en VTT"): "Export as VTT",
+        _("Sous-titres WebVTT"): "WebVTT subtitles",
+        "Exporter en HTML": "Export as HTML",
+        "Page web autonome": "Self-contained web page",
+        "Exporter en PDF": "Export as PDF",
+        "Nécessite pandoc": "Requires pandoc",
+        _("File d'attente"): "Queue",
+        _("Démarrer"): "Start",
+        _("Annuler le traitement en cours"): "Cancel current processing",
+        _("Actions sur la file"): "Queue actions",
+        _("Réessayer les échecs"): "Retry failures",
+        _("Nettoyer les terminés"): "Clear finished",
+        _("File d'attente vide"): "Empty queue",
+        _("Ajoutez une URL YouTube ou un fichier audio ci-dessus pour commencer."):
+            "Add a YouTube URL or an audio file above to get started.",
+        _("Transcriptions"): "Transcripts",
+        _("Rechercher (nom ou contenu)..."): "Search (name or content)...",
+        _("Ouvrir le dossier des transcriptions"): "Open transcripts folder",
+        _("Aucune transcription"): "No transcripts yet",
+        _("Les fichiers Markdown apparaîtront ici après le traitement de la file."):
+            "Markdown files will appear here once the queue is processed.",
+        _("Ouvrir le dossier"): "Open folder",
+        _("Aucun résultat"): "No results",
+        _("Aucune transcription ne correspond à cette recherche."):
+            "No transcript matches this search.",
+        _("Prêt"): "Ready",
+        "En attente": "Pending",
+        "En cours": "Running",
+        "Terminé": "Done",
+        "Erreur": "Error",
+        "Annulé": "Cancelled",
+        _("Résumé IA"): "AI summary",
+        _("Aperçu dans l'app"): "Preview in app",
+        "Discuter avec l'IA": "Chat with AI",
+        _("Ouvrir (externe)"): "Open (external)",
+        _("Supprimer"): "Delete",
+        _("Réessayer"): "Retry",
+        _("Retirer de la file"): "Remove from queue",
+        _("Actions"): _("Actions"),
+        _("Chapitres"): "Chapters",
+        _("Paramètres"): "Settings",
+        _("Clé API Mistral requise"): "Mistral API key required",
+        _("Aucune clé API Mistral configurée — les transcriptions seront impossibles"):
+            "No Mistral API key configured — transcription will be impossible",
+        _("Configurer"): "Configure",
+        _("API Mistral"): "Mistral API",
+        _("Clé API"): "API key",
+        _("Dossier des transcriptions"): "Transcripts folder",
+        _("Dossier"): "Folder",
+        _("Parcourir..."): "Browse...",
+        _("Apparence"): "Appearance",
+        _("Thème"): "Theme",
+        _("Clair, sombre ou celui du système"): "Light, dark or system",
+        _("Système"): "System",
+        _("Clair"): "Light",
+        _("Sombre"): "Dark",
+        _("Traitement"): "Processing",
+        _("Transcriptions en parallèle"): "Parallel transcriptions",
+        _("Nombre d'éléments traités simultanément"): "Number of items processed simultaneously",
+        "Voix TTS": "TTS voice",
+        "Aucune": "None",
+        "Vue d'ensemble": "Overview",
+        "Par mois": "Per month",
+        "Par modèle": "Per model",
+        "Fichiers": "Files",
+        "Durée totale": "Total duration",
+        _("Coût estimé"): "Estimated cost",
+        "Tokens": "Tokens",
+        "Vitesse apprise": "Learned speed",
+        "Mois": "Month",
+        "Modèle": "Model",
+        "Aucun": "None",
+        "transcriptions": "transcripts",
+        "min": "min",
+        _("File terminée"): "Queue finished",
+        "Transcription terminée : ": "Transcription finished: ",
+        "Résumé IA disponible": "AI summary available",
+        _("Général"): "General",
+        _("Modèles de transcription"): "Transcription models",
+        _("Mistral (API officielle)"): "Mistral (official API)",
+        _("Mes modèles perso"): "My custom models",
+        _("Ajouter un modèle perso"): "Add a custom model",
+        _("Ajouter le modèle"): "Add model",
+        _("Playlist YouTube"): "YouTube playlist",
+        _("Chargement de la playlist..."): "Loading playlist...",
+        _("Tout sélectionner"): "Select all",
+        _("Tout désélectionner"): "Deselect all",
+        _("Ajouter une playlist"): "Add a playlist",
+        _("Copier le résumé (Markdown)"): "Copy summary (Markdown)",
+        _("Copier le Markdown brut"): "Copy raw Markdown",
+        "Écouter": "Listen",
+        "Pause": "Pause",
+        "Lecture": "Playback",
+        "Envoyer": "Send",
+        "Posez une question sur cette transcription...":
+            "Ask a question about this transcript...",
+        "Recherche web : ": "Web search: ",
+        "Réflexion...": "Thinking...",
+        "Génération audio...": "Generating audio...",
+        _("Supprimer la transcription"): "Delete transcript",
+        "Supprimer : ": "Delete: ",
+        " ?": "?",
+        _("Annuler"): "Cancel",
+        _("Enregistrer"): "Save",
+        _("Ouvrir"): "Open",
+        _("Choisir un fichier audio"): "Choose an audio file",
+        _("Dossier des transcriptions"): "Transcripts folder",
+        _("Valider"): "OK",
+    },
+}
 
 # ============================================================================
 # FEUILLE DE STYLE CUSTOM (accent orange VoxCast / Mistral)
@@ -215,6 +377,47 @@ button.suggested-action {
     margin-top: 14px;
     font-weight: 700;
 }
+
+.chat-bubble-user {
+    background-color: @vox_accent_soft;
+    border-radius: 14px;
+    padding: 10px 14px;
+}
+
+.chat-bubble-assistant {
+    background-color: alpha(@theme_fg_color, 0.07);
+    border-radius: 14px;
+    padding: 10px 14px;
+}
+
+.tts-current {
+    background-color: @vox_accent_soft;
+    border-radius: 8px;
+}
+
+.stat-card {
+    background-color: @card_bg_color;
+    border: 1px solid @borders;
+    border-radius: 16px;
+    padding: 14px 18px;
+}
+
+.stat-value {
+    font-size: 24px;
+    font-weight: 800;
+}
+
+.bar-track {
+    background-color: alpha(@theme_fg_color, 0.10);
+    border-radius: 999px;
+    min-height: 10px;
+}
+
+.bar-fill {
+    background-image: linear-gradient(90deg, #ffa94d, #ff7a18 55%, #f03e3e);
+    border-radius: 999px;
+    min-height: 10px;
+}
 """
 
 
@@ -298,25 +501,40 @@ class VoxCastWindow:
         header.set_title_widget(switcher)
 
         settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
-        settings_btn.set_tooltip_text("Paramètres")
+        settings_btn.set_tooltip_text(_(_("Paramètres")))
         settings_btn.connect("clicked", self.on_settings_clicked)
         header.pack_end(settings_btn)
 
+        # Sélecteur de langue FR/EN
+        lang_btn = Gtk.MenuButton(icon_name="preferences-desktop-locale-symbolic",
+                                  tooltip_text="Language / Langue")
+        lang_menu = Gio.Menu()
+        lang_menu.append("Français", "lang.fr")
+        lang_menu.append("English", "lang.en")
+        lang_btn.set_menu_model(lang_menu)
+        lang_actions = Gio.SimpleActionGroup()
+        for code in ("fr", "en"):
+            act = Gio.SimpleAction(name=code)
+            act.connect("activate", lambda *_a, c=code: self.on_language_changed(c))
+            lang_actions.add_action(act)
+        lang_btn.insert_action_group("lang", lang_actions)
+        header.pack_end(lang_btn)
+
         # Bannière quand la clé API manque
         self.api_banner = Adw.Banner(
-            title="Aucune clé API Mistral configurée — les transcriptions seront impossibles",
-            button_label="Configurer",
+            title=_("Aucune clé API Mistral configurée — les transcriptions seront impossibles"),
+            button_label=_("Configurer"),
         )
         self.api_banner.connect("button-clicked",
-                                lambda *_: self.on_settings_clicked(None))
+                                lambda *_a: self.on_settings_clicked(None))
         self.api_banner.set_revealed(not self.api_key)
 
         # ===== CONTENU : deux pages =====
         self.stack.add_titled_with_icon(
-            self._build_transcribe_page(), "transcribe", "Transcrire",
+            self._build_transcribe_page(), "transcribe", _("Transcrire"),
             "audio-input-microphone-symbolic")
         self.stack.add_titled_with_icon(
-            self._build_library_page(), "library", "Bibliothèque",
+            self._build_library_page(), "library", _("Bibliothèque"),
             "folder-documents-symbolic")
 
         toolbar_view = Adw.ToolbarView()
@@ -333,6 +551,19 @@ class VoxCastWindow:
         self.refresh_transcripts_list()
 
         self.window.present()
+
+    def on_language_changed(self, code: str):
+        """Change la langue de l'UI et reconstruit la fenêtre."""
+        global LANG
+        if code == LANG:
+            return
+        LANG = code
+        self.save_settings()
+        if self.window is not None:
+            win = self.window
+            self.window = None
+            win.destroy()
+            self.on_activate(self.app)
 
     def _load_css(self):
         """Charge la feuille de style custom de VoxCast."""
@@ -397,7 +628,7 @@ class VoxCastWindow:
             css_classes=["hero-title"],
         )
         subtitle = Gtk.Label(
-            label="Transcrivez vos vidéos et fichiers audio en Markdown — propulsé par Voxtral.",
+            label=_("Transcrivez vos vidéos et fichiers audio en Markdown — propulsé par Voxtral."),
             halign=Gtk.Align.START,
             css_classes=["dim-label"],
         )
@@ -451,25 +682,25 @@ class VoxCastWindow:
         return scrolled
 
     def _build_source_section(self) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup(title="Nouvelle transcription")
+        group = Adw.PreferencesGroup(title=_("Nouvelle transcription"))
 
         # URL ou fichier
         source_row = Gtk.Box(spacing=10)
         self.url_entry = Gtk.Entry(
-            placeholder_text="URL YouTube ou glissez un fichier audio ici",
+            placeholder_text=_("URL YouTube ou glissez un fichier audio ici"),
             hexpand=True,
         )
-        self.url_entry.connect("activate", lambda *_: self.on_add_to_queue())
-        self.url_entry.connect("changed", lambda *_: self._on_source_changed())
+        self.url_entry.connect("activate", lambda *_a: self.on_add_to_queue())
+        self.url_entry.connect("changed", lambda *_a: self._on_source_changed())
 
         browse_btn = Gtk.Button(
             icon_name="document-open-symbolic",
-            tooltip_text="Parcourir un fichier audio",
+            tooltip_text=_("Parcourir un fichier audio"),
         )
         browse_btn.connect("clicked", self.on_browse_audio)
 
         add_btn = Gtk.Button(
-            label="Ajouter",
+            label=_("Ajouter"),
             icon_name="list-add-symbolic",
         )
         add_btn.add_css_class("suggested-action")
@@ -490,18 +721,18 @@ class VoxCastWindow:
         group.add(self.cost_label)
 
         # ===== Options avancées (repliées par défaut) =====
-        options = Adw.ExpanderRow(title="Options avancées")
+        options = Adw.ExpanderRow(title=_("Options avancées"))
 
         # Modèle de transcription (presets Mistral + modèles perso)
         model_row = Adw.ActionRow(
-            title="Modèle de transcription",
-            subtitle="Preset Mistral ou API perso (compatible /v1/audio/transcriptions)",
+            title=_("Modèle de transcription"),
+            subtitle=_("Preset Mistral ou API perso (compatible /v1/audio/transcriptions)"),
         )
         self.model_dropdown = Gtk.DropDown(valign=Gtk.Align.CENTER)
         self.model_dropdown.connect("notify::selected", self.on_model_changed)
         self._rebuild_model_dropdown()
         manage_btn = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER,
-                                tooltip_text="Gérer les modèles personnalisés")
+                                tooltip_text=_("Gérer les modèles personnalisés"))
         manage_btn.connect("clicked", self.on_manage_models)
         model_suffix = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
         model_suffix.append(self.model_dropdown)
@@ -511,23 +742,23 @@ class VoxCastWindow:
         options.add_row(model_row)
 
         # Nom de sortie
-        name_row = Adw.EntryRow(title="Nom de sortie (auto si vide)")
+        name_row = Adw.EntryRow(title=_("Nom de sortie (auto si vide)"))
         self.name_entry = name_row
         options.add_row(name_row)
 
         # Langue + Timestamps
-        lang_row = Adw.ActionRow(title="Langue", subtitle="Forcer la langue améliore la précision")
+        lang_row = Adw.ActionRow(title=_("Langue"), subtitle=_("Forcer la langue améliore la précision"))
         lang_model = Gtk.StringList()
-        for _, name in LANGUAGES:
+        for _code, name in LANGUAGES:
             lang_model.append(name)
         self.lang_dropdown = Gtk.DropDown(model=lang_model, valign=Gtk.Align.CENTER)
         lang_row.add_suffix(self.lang_dropdown)
         lang_row.set_activatable_widget(self.lang_dropdown)
         options.add_row(lang_row)
 
-        ts_row = Adw.ActionRow(title="Timestamps", subtitle="Inclure les horaires dans la sortie")
+        ts_row = Adw.ActionRow(title=_("Timestamps"), subtitle=_("Inclure les horaires dans la sortie"))
         ts_model = Gtk.StringList()
-        for _, name in TIMESTAMP_OPTIONS:
+        for _code2, name in TIMESTAMP_OPTIONS:
             ts_model.append(name)
         self.ts_dropdown = Gtk.DropDown(model=ts_model, valign=Gtk.Align.CENTER)
         ts_row.add_suffix(self.ts_dropdown)
@@ -535,21 +766,21 @@ class VoxCastWindow:
         options.add_row(ts_row)
 
         # Diarisation
-        diarize_row = Adw.ActionRow(title="Diarisation", subtitle="Identifier les speakers")
+        diarize_row = Adw.ActionRow(title=_("Diarisation"), subtitle=_("Identifier les speakers"))
         self.diarize_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         diarize_row.add_suffix(self.diarize_switch)
         diarize_row.set_activatable_widget(self.diarize_switch)
         options.add_row(diarize_row)
 
         # Garder l'audio
-        keep_row = Adw.ActionRow(title="Garder l'audio", subtitle="Conserver le MP3 téléchargé")
+        keep_row = Adw.ActionRow(title=_("Garder l'audio"), subtitle=_("Conserver le MP3 téléchargé"))
         self.keep_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         keep_row.add_suffix(self.keep_switch)
         keep_row.set_activatable_widget(self.keep_switch)
         options.add_row(keep_row)
 
         # Segment (transcription partielle)
-        seg_row = Adw.ActionRow(title="Segment", subtitle="Transcrire seulement une partie (HH:MM:SS)")
+        seg_row = Adw.ActionRow(title=_("Segment"), subtitle=_("Transcrire seulement une partie (HH:MM:SS)"))
         seg_box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
         self.start_entry = Gtk.Entry(placeholder_text="Début", width_chars=7)
         self.end_entry = Gtk.Entry(placeholder_text="Fin", width_chars=7)
@@ -560,18 +791,18 @@ class VoxCastWindow:
         options.add_row(seg_row)
 
         # Context bias
-        bias_row = Adw.EntryRow(title="Context bias (termes, espaces, max 100)")
+        bias_row = Adw.EntryRow(title=_("Context bias (termes, espaces, max 100)"))
         self.bias_entry = bias_row
         options.add_row(bias_row)
 
         # Exports sous-titres
-        srt_row = Adw.ActionRow(title="Exporter en SRT", subtitle="Sous-titres SubRip")
+        srt_row = Adw.ActionRow(title=_("Exporter en SRT"), subtitle=_("Sous-titres SubRip"))
         self.srt_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         srt_row.add_suffix(self.srt_switch)
         srt_row.set_activatable_widget(self.srt_switch)
         options.add_row(srt_row)
 
-        vtt_row = Adw.ActionRow(title="Exporter en VTT", subtitle="Sous-titres WebVTT")
+        vtt_row = Adw.ActionRow(title=_("Exporter en VTT"), subtitle=_("Sous-titres WebVTT"))
         self.vtt_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         vtt_row.add_suffix(self.vtt_switch)
         vtt_row.set_activatable_widget(self.vtt_switch)
@@ -581,13 +812,13 @@ class VoxCastWindow:
         return group
 
     def _build_queue_section(self) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup(title="File d'attente")
+        group = Adw.PreferencesGroup(title=_("File d'attente"))
 
         # Actions de la file dans le header : Démarrer / Annuler / menu ⋮
         header_box = Gtk.Box(spacing=6)
 
         self.start_btn = Gtk.Button(
-            label="Démarrer",
+            label=_("Démarrer"),
             icon_name="media-playback-start-symbolic",
         )
         self.start_btn.add_css_class("suggested-action")
@@ -596,25 +827,25 @@ class VoxCastWindow:
 
         self.cancel_btn = Gtk.Button(
             icon_name="process-stop-symbolic",
-            tooltip_text="Annuler le traitement en cours",
+            tooltip_text=_("Annuler le traitement en cours"),
             sensitive=False,
         )
         self.cancel_btn.connect("clicked", self.on_cancel_clicked)
 
         queue_menu_btn = Gtk.MenuButton(
             icon_name="view-more-symbolic",
-            tooltip_text="Actions sur la file",
+            tooltip_text=_("Actions sur la file"),
         )
         queue_menu = Gio.Menu()
-        queue_menu.append("Réessayer les échecs", "queue.retry")
-        queue_menu.append("Nettoyer les terminés", "queue.clear")
+        queue_menu.append(_("Réessayer les échecs"), "queue.retry")
+        queue_menu.append(_("Nettoyer les terminés"), "queue.clear")
         queue_menu_btn.set_menu_model(queue_menu)
 
         queue_actions = Gio.SimpleActionGroup()
         act_retry = Gio.SimpleAction(name="retry")
-        act_retry.connect("activate", lambda *_: self.on_retry_failed())
+        act_retry.connect("activate", lambda *_a: self.on_retry_failed())
         act_clear = Gio.SimpleAction(name="clear")
-        act_clear.connect("activate", lambda *_: self.on_clear_done())
+        act_clear.connect("activate", lambda *_a: self.on_clear_done())
         queue_actions.add_action(act_retry)
         queue_actions.add_action(act_clear)
         queue_menu_btn.insert_action_group("queue", queue_actions)
@@ -640,10 +871,10 @@ class VoxCastWindow:
         # État vide avec call-to-action
         empty_page = Adw.StatusPage(
             icon_name="list-add-symbolic",
-            title="File d'attente vide",
-            description="Ajoutez une URL YouTube ou un fichier audio ci-dessus pour commencer.",
+            title=_("File d'attente vide"),
+            description=_("Ajoutez une URL YouTube ou un fichier audio ci-dessus pour commencer."),
         )
-        browse_empty_btn = Gtk.Button(label="Parcourir un fichier audio")
+        browse_empty_btn = Gtk.Button(label=_("Parcourir un fichier audio"))
         browse_empty_btn.connect("clicked", self.on_browse_audio)
         empty_page.set_child(browse_empty_btn)
 
@@ -658,18 +889,18 @@ class VoxCastWindow:
         return group
 
     def _build_transcripts_section(self) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup(title="Transcriptions")
+        group = Adw.PreferencesGroup(title=_("Transcriptions"))
 
         # Recherche + bouton dossier dans le header
         self.search_entry = Gtk.SearchEntry(
-            placeholder_text="Rechercher (nom ou contenu)...",
+            placeholder_text=_("Rechercher (nom ou contenu)..."),
             hexpand=True,
         )
         self.search_entry.connect("search-changed", self.on_search_changed)
 
         folder_btn = Gtk.Button(
             icon_name="folder-open-symbolic",
-            tooltip_text="Ouvrir le dossier des transcriptions",
+            tooltip_text=_("Ouvrir le dossier des transcriptions"),
         )
         folder_btn.connect("clicked", self.on_open_folder_clicked)
 
@@ -695,17 +926,17 @@ class VoxCastWindow:
         # États vides
         empty_page = Adw.StatusPage(
             icon_name="folder-documents-symbolic",
-            title="Aucune transcription",
-            description="Les fichiers Markdown apparaîtront ici après le traitement de la file.",
+            title=_("Aucune transcription"),
+            description=_("Les fichiers Markdown apparaîtront ici après le traitement de la file."),
         )
-        open_folder_btn = Gtk.Button(label="Ouvrir le dossier")
+        open_folder_btn = Gtk.Button(label=_("Ouvrir le dossier"))
         open_folder_btn.connect("clicked", self.on_open_folder_clicked)
         empty_page.set_child(open_folder_btn)
 
         no_results_page = Adw.StatusPage(
             icon_name="edit-find-symbolic",
-            title="Aucun résultat",
-            description="Aucune transcription ne correspond à cette recherche.",
+            title=_("Aucun résultat"),
+            description=_("Aucune transcription ne correspond à cette recherche."),
         )
 
         self.transcripts_stack = Gtk.Stack()
@@ -723,7 +954,7 @@ class VoxCastWindow:
         bar = Gtk.Box(spacing=14, halign=Gtk.Align.FILL, css_classes=["status-bar"])
 
         self.status_label = Gtk.Label(
-            label="Prêt",
+            label=_("Prêt"),
             halign=Gtk.Align.START,
             hexpand=True,
             ellipsize=Pango.EllipsizeMode.END,
@@ -825,7 +1056,7 @@ class VoxCastWindow:
     def on_browse_audio(self, button):
         """Ouvre un dialogue de sélection de fichier audio."""
         dialog = Gtk.FileChooserDialog(
-            title="Choisir un fichier audio",
+            title=_("Choisir un fichier audio"),
             transient_for=self.window,
             action=Gtk.FileChooserAction.OPEN,
             modal=True,
@@ -835,7 +1066,7 @@ class VoxCastWindow:
         for ext in ["mp3", "wav", "m4a", "webm", "ogg", "flac", "aac", "wma"]:
             filt.add_pattern(f"*.{ext}")
         dialog.add_filter(filt)
-        dialog.add_buttons("Annuler", Gtk.ResponseType.CANCEL, "Ouvrir", Gtk.ResponseType.ACCEPT)
+        dialog.add_buttons(_("Annuler"), Gtk.ResponseType.CANCEL, _("Ouvrir"), Gtk.ResponseType.ACCEPT)
         dialog.connect("response", self._on_browse_audio_response)
         dialog.present()
 
@@ -904,33 +1135,33 @@ class VoxCastWindow:
         dialog = Adw.Window(
             transient_for=self.window,
             modal=True,
-            title="Modèles de transcription",
+            title=_("Modèles de transcription"),
             default_width=580,
             default_height=620,
         )
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
-        header.set_title_widget(Gtk.Label(label="Modèles de transcription",
+        header.set_title_widget(Gtk.Label(label=_("Modèles de transcription"),
                                            css_classes=["title-4"]))
         toolbar.add_top_bar(header)
 
         page = Adw.PreferencesPage()
 
         preset_group = Adw.PreferencesGroup(
-            title="Mistral (API officielle)",
+            title=_("Mistral (API officielle)"),
             description="Sélectionnables dans la liste déroulante « Modèle de transcription »")
         for mid, lbl in vtt.MISTRAL_TRANSCRIBE_MODELS:
             preset_group.add(Adw.ActionRow(title=lbl, subtitle=mid))
         page.add(preset_group)
 
         self._custom_group = Adw.PreferencesGroup(
-            title="Mes modèles perso",
+            title=_("Mes modèles perso"),
             description="Endpoints compatibles /v1/audio/transcriptions (Groq, OpenAI, etc.)")
         page.add(self._custom_group)
         self._custom_rows = []
         self._fill_custom_models_group()
 
-        add_group = Adw.PreferencesGroup(title="Ajouter un modèle perso")
+        add_group = Adw.PreferencesGroup(title=_("Ajouter un modèle perso"))
         self._cm_name = Adw.EntryRow(title="Nom (ex: Groq Whisper)")
         self._cm_model = Adw.EntryRow(title="Model ID (ex: whisper-large-v3)")
         self._cm_url = Adw.EntryRow(title="URL de base de l'API (ex: https://api.groq.com)")
@@ -940,7 +1171,7 @@ class VoxCastWindow:
         key_row.set_activatable_widget(self._cm_key)
         for row in (self._cm_name, self._cm_model, self._cm_url, key_row):
             add_group.add(row)
-        add_btn = Gtk.Button(label="Ajouter le modèle",
+        add_btn = Gtk.Button(label=_("Ajouter le modèle"),
                              css_classes=["suggested-action"],
                              halign=Gtk.Align.END, margin_top=8, margin_bottom=8,
                              margin_end=12)
@@ -1099,14 +1330,14 @@ class VoxCastWindow:
         dialog = Adw.Window(
             transient_for=self.window,
             modal=True,
-            title="Ajouter une playlist",
+            title=_("Ajouter une playlist"),
             default_width=620,
             default_height=560,
         )
 
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
-        header.set_title_widget(Gtk.Label(label="Playlist YouTube", css_classes=["title-4"]))
+        header.set_title_widget(Gtk.Label(label=_("Playlist YouTube"), css_classes=["title-4"]))
         toolbar.add_top_bar(header)
 
         # État de chargement
@@ -1116,7 +1347,7 @@ class VoxCastWindow:
         spinner = Adw.Spinner()
         spinner.set_size_request(48, 48)
         loading_box.append(spinner)
-        loading_box.append(Gtk.Label(label="Chargement de la playlist...",
+        loading_box.append(Gtk.Label(label=_("Chargement de la playlist..."),
                                       css_classes=["dim-label"]))
         toolbar.set_content(loading_box)
 
@@ -1183,12 +1414,12 @@ class VoxCastWindow:
 
         # Barre d'actions
         actions = Gtk.Box(spacing=8, halign=Gtk.Align.END)
-        select_all = Gtk.Button(label="Tout sélectionner")
-        select_all.connect("clicked", lambda *_: list_box.select_all())
-        select_none = Gtk.Button(label="Tout désélectionner")
-        select_none.connect("clicked", lambda *_: list_box.unselect_all())
-        add_btn = Gtk.Button(label="Ajouter", css_classes=["suggested-action"])
-        add_btn.connect("clicked", lambda *_: self._add_playlist_selection(
+        select_all = Gtk.Button(label=_("Tout sélectionner"))
+        select_all.connect("clicked", lambda *_a: list_box.select_all())
+        select_none = Gtk.Button(label=_("Tout désélectionner"))
+        select_none.connect("clicked", lambda *_a: list_box.unselect_all())
+        add_btn = Gtk.Button(label=_("Ajouter"), css_classes=["suggested-action"])
+        add_btn.connect("clicked", lambda *_a: self._add_playlist_selection(
             dialog, list_box, entries))
         actions.append(select_all)
         actions.append(select_none)
@@ -1264,12 +1495,12 @@ class VoxCastWindow:
         )
 
         status_row = Gtk.Box(spacing=8, halign=Gtk.Align.START)
-        status_label = Gtk.Label(
-            label=STATUS_LABELS.get(item.status, item.status),
+        status_lbl = Gtk.Label(
+            label=status_label(item.status),
             halign=Gtk.Align.START,
             css_classes=["status-pill", f"pill-{item.status}"],
         )
-        status_row.append(status_label)
+        status_row.append(status_lbl)
         if item.status == STATUS_ERROR and item.error:
             error_label = Gtk.Label(
                 label=item.error,
@@ -1291,24 +1522,24 @@ class VoxCastWindow:
         info_box.append(name_label)
         info_box.append(status_row)
         info_box.append(progress_bar)
-        item.status_label = status_label
+        item.status_label = status_lbl
         item.progress_bar = progress_bar
 
         # Menu par item (⋮) : réessayer / retirer
         menu_btn = Gtk.MenuButton(
             icon_name="view-more-symbolic",
             valign=Gtk.Align.CENTER,
-            tooltip_text="Actions",
+            tooltip_text=_("Actions"),
         )
         menu = Gio.Menu()
         actions = Gio.SimpleActionGroup()
         if item.status in (STATUS_ERROR, STATUS_CANCELLED):
-            menu.append("Réessayer", "item.retry")
+            menu.append(_("Réessayer"), "item.retry")
             act = Gio.SimpleAction(name="retry")
             act.connect("activate", lambda *_a, it=item: self._retry_queue_item(it))
             actions.add_action(act)
         if item.status != STATUS_RUNNING:
-            menu.append("Retirer de la file", "item.remove")
+            menu.append(_("Retirer de la file"), "item.remove")
             act = Gio.SimpleAction(name="remove")
             act.connect("activate", lambda *_a, it=item: self._remove_queue_item(it))
             actions.add_action(act)
@@ -1475,7 +1706,7 @@ class VoxCastWindow:
             if self.cancelled:
                 GLib.idle_add(self.update_status, "File annulée", "yellow")
             else:
-                GLib.idle_add(self.update_status, "File terminée", "green")
+                GLib.idle_add(self.update_status, _("File terminée"), "green")
                 GLib.idle_add(self._send_notification,
                     "File d'attente terminée", f"{total} élément(s) traité(s)")
 
@@ -1532,7 +1763,7 @@ class VoxCastWindow:
     def _update_queue_item_status(self, item: QueueItem):
         """Met à jour la pastille de statut d'un item de la file."""
         if item.status_label:
-            item.status_label.set_label(STATUS_LABELS.get(item.status, item.status))
+            item.status_label.set_label(status_label(item.status))
             for cls in PILL_CLASSES:
                 item.status_label.remove_css_class(cls)
             item.status_label.add_css_class(f"pill-{item.status}")
@@ -1680,7 +1911,7 @@ class VoxCastWindow:
         title_row.append(name_label)
         if t.get("has_summary"):
             title_row.append(Gtk.Label(
-                label="Résumé IA",
+                label=_("Résumé IA"),
                 halign=Gtk.Align.START,
                 css_classes=["status-pill", "pill-summary"],
             ))
@@ -1715,7 +1946,7 @@ class VoxCastWindow:
         menu_btn = Gtk.MenuButton(
             icon_name="view-more-symbolic",
             valign=Gtk.Align.CENTER,
-            tooltip_text="Actions",
+            tooltip_text=_("Actions"),
         )
         menu = Gio.Menu()
         menu.append("Aperçu dans l'app", "tr.preview")
@@ -1804,12 +2035,12 @@ class VoxCastWindow:
             label=transcript["name"], ellipsize=Pango.EllipsizeMode.END,
             max_width_chars=40, css_classes=["title-4"]))
         copy_btn = Gtk.Button(icon_name="edit-copy-symbolic",
-                              tooltip_text="Copier le Markdown brut")
-        copy_btn.connect("clicked", lambda *_: self._copy_to_clipboard(md_text))
+                              tooltip_text=_("Copier le Markdown brut"))
+        copy_btn.connect("clicked", lambda *_a: self._copy_to_clipboard(md_text))
         header.pack_end(copy_btn)
-        summary_btn = Gtk.Button(label="Résumé IA", css_classes=["suggested-action"])
+        summary_btn = Gtk.Button(label=_("Résumé IA"), css_classes=["suggested-action"])
         summary_btn.connect("clicked",
-                            lambda *_: self.on_summarize_clicked(transcript))
+                            lambda *_a: self.on_summarize_clicked(transcript))
         header.pack_end(summary_btn)
         toolbar.add_top_bar(header)
 
@@ -1825,7 +2056,7 @@ class VoxCastWindow:
             source_url = self._extract_source_url(md_text)
             toc = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
                           css_classes=["status-bar"])
-            toc.append(Gtk.Label(label="Chapitres", halign=Gtk.Align.START,
+            toc.append(Gtk.Label(label=_("Chapitres"), halign=Gtk.Align.START,
                                  margin_bottom=4, css_classes=["heading"]))
             for secs, chap_title in chapters:
                 btn = Gtk.Button(halign=Gtk.Align.START, css_classes=["flat"])
@@ -2292,12 +2523,12 @@ class VoxCastWindow:
 
         dialog = Adw.MessageDialog(
             transient_for=self.window,
-            title="Supprimer la transcription",
+            title=_("Supprimer la transcription"),
             body=f"Supprimer : {name} ?",
             modal=True,
         )
-        dialog.add_response("cancel", "Annuler")
-        dialog.add_response("delete", "Supprimer")
+        dialog.add_response("cancel", _("Annuler"))
+        dialog.add_response("delete", _("Supprimer"))
         dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
         dialog.connect("response", self._on_delete_response, path)
         dialog.present()
@@ -2320,36 +2551,36 @@ class VoxCastWindow:
 
     def on_settings_clicked(self, button):
         dialog = Adw.PreferencesDialog()
-        dialog.set_title("Paramètres")
+        dialog.set_title(_("Paramètres"))
 
         page = Adw.PreferencesPage()
-        page.set_title("Général")
+        page.set_title(_("Général"))
 
         # Clé API
-        api_group = Adw.PreferencesGroup(title="API Mistral")
-        api_row = Adw.EntryRow(title="Clé API")
+        api_group = Adw.PreferencesGroup(title=_("API Mistral"))
+        api_row = Adw.EntryRow(title=_("Clé API"))
         api_row.set_text(self.api_key)
         api_row.connect("changed", self.on_api_key_changed)
         api_group.add(api_row)
         page.add(api_group)
 
         # Dossier de sortie
-        output_group = Adw.PreferencesGroup(title="Dossier des transcriptions")
-        output_row = Adw.ActionRow(title="Dossier", subtitle=str(self.transcripts_dir))
-        browse_btn = Gtk.Button(label="Parcourir...", halign=Gtk.Align.END)
+        output_group = Adw.PreferencesGroup(title=_("Dossier des transcriptions"))
+        output_row = Adw.ActionRow(title=_("Dossier"), subtitle=str(self.transcripts_dir))
+        browse_btn = Gtk.Button(label=_("Parcourir..."), halign=Gtk.Align.END)
         browse_btn.connect("clicked", self.on_browse_output, output_row)
         output_row.add_suffix(browse_btn)
         output_group.add(output_row)
         page.add(output_group)
 
         # Apparence : thème clair / sombre
-        theme_group = Adw.PreferencesGroup(title="Apparence")
+        theme_group = Adw.PreferencesGroup(title=_("Apparence"))
         theme_row = Adw.ActionRow(
-            title="Thème",
-            subtitle="Clair, sombre ou celui du système",
+            title=_("Thème"),
+            subtitle=_("Clair, sombre ou celui du système"),
         )
         theme_model = Gtk.StringList()
-        for name in ["Système", "Clair", "Sombre"]:
+        for name in [_("Système"), _("Clair"), _("Sombre")]:
             theme_model.append(name)
         theme_idx = {"default": 0, "light": 1, "dark": 2}[self.color_scheme]
         self.theme_dropdown = Gtk.DropDown(
@@ -2361,10 +2592,10 @@ class VoxCastWindow:
         page.add(theme_group)
 
         # Traitement parallèle
-        proc_group = Adw.PreferencesGroup(title="Traitement")
+        proc_group = Adw.PreferencesGroup(title=_("Traitement"))
         workers_row = Adw.ActionRow(
-            title="Transcriptions en parallèle",
-            subtitle="Nombre d'éléments traités simultanément",
+            title=_("Transcriptions en parallèle"),
+            subtitle=_("Nombre d'éléments traités simultanément"),
         )
         adjustment = Gtk.Adjustment(
             value=self.max_workers, lower=1, upper=8, step_increment=1)
@@ -2397,12 +2628,12 @@ class VoxCastWindow:
 
     def on_browse_output(self, button, output_row):
         dialog = Gtk.FileChooserDialog(
-            title="Dossier des transcriptions",
+            title=_("Dossier des transcriptions"),
             transient_for=self.window,
             action=Gtk.FileChooserAction.SELECT_FOLDER,
             modal=True,
         )
-        dialog.add_buttons("Annuler", Gtk.ResponseType.CANCEL, "Valider", Gtk.ResponseType.ACCEPT)
+        dialog.add_buttons(_("Annuler"), Gtk.ResponseType.CANCEL, _("Valider"), Gtk.ResponseType.ACCEPT)
         dialog.connect("response", self._on_browse_response, output_row)
         dialog.present()
 
@@ -2439,7 +2670,7 @@ class VoxCastWindow:
 
         dialog = Adw.MessageDialog(
             transient_for=self.window,
-            title="Clé API Mistral requise",
+            title=_("Clé API Mistral requise"),
             body="Aucune clé API Mistral n'est configurée.\n"
                  "Saisissez votre clé pour continuer (elle sera sauvegardée).",
             modal=True,
@@ -2456,8 +2687,8 @@ class VoxCastWindow:
         content_box.append(entry)
         dialog.set_extra_child(content_box)
 
-        dialog.add_response("cancel", "Annuler")
-        dialog.add_response("save", "Enregistrer")
+        dialog.add_response("cancel", _("Annuler"))
+        dialog.add_response("save", _("Enregistrer"))
         dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
 
         def on_response(d, response):
