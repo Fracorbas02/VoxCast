@@ -239,6 +239,7 @@ TRANSLATIONS = {
         _("Transcriptions en parallèle"): "Parallel transcriptions",
         _("Nombre d'éléments traités simultanément"): "Number of items processed simultaneously",
         "Voix TTS": "TTS voice",
+        "TTS": "TTS",
         "Aucune": "None",
         "Vue d'ensemble": "Overview",
         "Par mois": "Per month",
@@ -379,6 +380,11 @@ list.voxcast-list row:selected {
 .pill-summary {
     background-color: @vox_accent_soft;
     color: @vox_accent;
+}
+
+.pill-tts {
+    background-color: alpha(@accent_bg_color, 0.18);
+    color: @accent_color;
 }
 
 progressbar.voxcast-progress trough {
@@ -2093,8 +2099,10 @@ class VoxCastWindow:
             self.transcripts_list.remove(row)
 
         summary_index = self._summaries_index()
+        tts_index = self._tts_index()
         if not query:
-            transcripts = [dict(t, has_summary=t["name"] in summary_index)
+            transcripts = [dict(t, has_summary=t["name"] in summary_index,
+                                has_tts=t["name"] in tts_index)
                            for t in self.all_transcripts]
         else:
             query_lower = query.lower()
@@ -2105,6 +2113,7 @@ class VoxCastWindow:
                     match = dict(t)
                     match["snippet"] = None
                     match["has_summary"] = t["name"] in summary_index
+                    match["has_tts"] = t["name"] in tts_index
                     transcripts.append(match)
                     continue
                 # Recherche par contenu (avec extrait autour du match)
@@ -2123,6 +2132,7 @@ class VoxCastWindow:
                             snippet = snippet + "…"
                         match["snippet"] = snippet
                         match["has_summary"] = t["name"] in summary_index
+                        match["has_tts"] = t["name"] in tts_index
                         transcripts.append(match)
                 except Exception:
                     continue
@@ -2173,7 +2183,7 @@ class VoxCastWindow:
             css_classes=["row-title"],
         )
 
-        # Pastille « Résumé IA » quand un résumé persisté existe pour ce fichier
+        # Pastilles « Résumé IA » / « TTS » quand les fichiers persistés existent
         title_row = Gtk.Box(spacing=8, halign=Gtk.Align.START)
         title_row.append(name_label)
         if t.get("has_summary"):
@@ -2181,6 +2191,12 @@ class VoxCastWindow:
                 label=_("Résumé IA"),
                 halign=Gtk.Align.START,
                 css_classes=["status-pill", "pill-summary"],
+            ))
+        if t.get("has_tts"):
+            title_row.append(Gtk.Label(
+                label=_("TTS"),
+                halign=Gtk.Align.START,
+                css_classes=["status-pill", "pill-tts"],
             ))
 
         date = datetime.fromtimestamp(t["modified"]).strftime("%Y-%m-%d %H:%M")
@@ -2537,6 +2553,17 @@ class VoxCastWindow:
                 index.add(name)
         return index
 
+    def _tts_index(self) -> set[str]:
+        """Noms des transcriptions dont le MP3 TTS existe (.summaries/<nom>.mp3)."""
+        index: set[str] = set()
+        sdir = self.transcripts_dir / ".summaries"
+        if not sdir.exists():
+            return index
+        for f in sdir.glob("*.mp3"):
+            if f.stem in {t["name"] for t in self.all_transcripts}:
+                index.add(f.stem)
+        return index
+
     def _load_summary(self, transcript: dict) -> Optional[str]:
         """Charge le résumé persisté (sans la ligne de métadonnées)."""
         try:
@@ -2775,6 +2802,7 @@ class VoxCastWindow:
             t["btn"].set_icon_name("media-playback-start-symbolic")
             self.toast(f"TTS impossible : {err}", "error", 6)
             return False
+        self.refresh_transcripts_list()  # fait apparaître la pastille « TTS »
         self._tts_play(dialog)
         return False
 
