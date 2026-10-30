@@ -70,12 +70,19 @@ def log(msg: str):
     print(f"[voxcast-mcp] {msg}", file=sys.stderr, flush=True)
 
 
+_SEND_LOCK = threading.Lock()
+
+
 def send(obj: dict):
     """Écrit une réponse JSON-RPC sur stdout (NDJSON), sans jamais planter
-    si le client a fermé le flux."""
+    si le client a fermé le flux. Lock : plusieurs tools/call peuvent
+    répondre en même temps depuis des threads, il ne faut pas entrelacer
+    les lignes."""
+    line = json.dumps(obj, ensure_ascii=False) + "\n"
     try:
-        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+        with _SEND_LOCK:
+            sys.stdout.write(line)
+            sys.stdout.flush()
     except (BrokenPipeError, ValueError, OSError):
         pass
 

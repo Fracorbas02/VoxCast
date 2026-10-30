@@ -199,9 +199,19 @@ def load_cache() -> dict:
         return {}
 
 
+CACHE_MAX_ENTRIES = 500
+# champs suffisants pour l'UI (durée, coût, auto-nom) — le dict yt-dlp complet
+# contient formats/thumbnails/etc. et gonflerait .cache.json démesurément
+INFO_KEYS = ("id", "title", "duration", "uploader", "webpage_url", "extractor",
+             "chapters")
+
+
 def save_cache(cache: dict):
-    with open(CACHE_FILE, "w") as f:
+    # écriture atomique (tmp + rename) pour éviter un JSON tronqué en cas de crash
+    tmp = CACHE_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
         json.dump(cache, f, indent=2)
+    os.replace(tmp, CACHE_FILE)
 
 
 def cache_key(url: str) -> str:
@@ -217,9 +227,15 @@ def get_video_info_cached(url: str, use_cache: bool = True) -> dict:
     print("(récupération des infos vidéo...)")
     with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
         info = ydl.extract_info(url, download=False)
-    cache[key] = info
+    # ne garder que les champs utiles
+    light = {k: info.get(k) for k in INFO_KEYS if info.get(k) is not None}
+    cache[key] = light
+    # plafond : on garde les entrées les plus récentes
+    if len(cache) > CACHE_MAX_ENTRIES:
+        for old in list(cache)[:len(cache) - CACHE_MAX_ENTRIES]:
+            del cache[old]
     save_cache(cache)
-    return info
+    return light
 
 
 def estimate_cost(duration_seconds: float) -> float:
@@ -413,7 +429,7 @@ def download_audio(url: str, output_dir: Path, use_cache: bool = True,
         if candidates:
             mp3_files = [candidates[0]]
         else:
-            sys.exit("Erreur: fichier audio introuvable après téléchargement.")
+            raise RuntimeError("Fichier audio introuvable après téléchargement.")
 
     mp3_path = mp3_files[0]
     file_size_mb = mp3_path.stat().st_size / (1024 * 1024)
@@ -435,7 +451,7 @@ def prepare_local_audio(audio_path: Path, output_dir: Path,
     audio_path = Path(audio_path)
 
     if not audio_path.exists():
-        sys.exit(f"Erreur: fichier introuvable: {audio_path}")
+        raise RuntimeError(f"Fichier introuvable: {audio_path}")
 
     duration = get_audio_duration_seconds(audio_path)
     title = audio_path.stem
