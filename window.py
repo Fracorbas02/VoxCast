@@ -466,6 +466,7 @@ class VoxCastWindow:
         self.color_scheme = "default"  # default | light | dark
         self.custom_models: list[dict] = []  # modèles perso {name, model, base_url, api_key}
         self.model_profile: Optional[dict] = None  # profil sélectionné
+        self.tts_voice: str = ""  # slug de la voix TTS (vide = voix par défaut)
         self._notif_counter = 0
         self._queue_total = 0
         self._last_summary = ""
@@ -2179,18 +2180,25 @@ class VoxCastWindow:
                    r'<span underline="single" foreground="#ff7a18">\1</span>', s)
         return s
 
-    def _build_md_view(self, md_text: str) -> Gtk.Widget:
-        """Rendu simple du Markdown en widgets GTK (titres, listes, code...)."""
+    def _build_md_view(self, md_text: str, collect: Optional[list] = None) -> Gtk.Widget:
+        """Rendu simple du Markdown en widgets GTK (titres, listes, code...).
+
+        Si ``collect`` est fourni (liste), chaque bloc de texte y est ajouté
+        sous la forme ``(label, texte_brut)`` — utilisé pour la lecture
+        synchronisée TTS (surlignage du paragraphe en cours).
+        """
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
                       halign=Gtk.Align.FILL)
 
-        def add_markup(markup, css_classes=None):
+        def add_markup(markup, css_classes=None, raw=None):
             label = Gtk.Label(halign=Gtk.Align.START, wrap=True, xalign=0,
                               selectable=True, use_markup=True)
             label.set_markup(markup)
             if css_classes:
                 label.set_css_classes(css_classes)
             box.append(label)
+            if collect is not None:
+                collect.append((label, raw if raw is not None else markup))
 
         def add_text(text, css_classes=None):
             label = Gtk.Label(halign=Gtk.Align.START, wrap=True, xalign=0,
@@ -2199,6 +2207,8 @@ class VoxCastWindow:
             if css_classes:
                 label.set_css_classes(css_classes)
             box.append(label)
+            if collect is not None:
+                collect.append((label, text))
 
         in_code = False
         code_lines: list[str] = []
@@ -2225,21 +2235,21 @@ class VoxCastWindow:
                 box.append(sep)
             elif stripped.startswith("### "):
                 add_markup(self._md_inline(stripped[4:]),
-                           ["md-heading", "title-4"])
+                           ["md-heading", "title-4"], raw=stripped[4:])
             elif stripped.startswith("## "):
                 add_markup(self._md_inline(stripped[3:]),
-                           ["md-heading", "title-3"])
+                           ["md-heading", "title-3"], raw=stripped[3:])
             elif stripped.startswith("# "):
                 add_markup(self._md_inline(stripped[2:]),
-                           ["md-heading", "title-2"])
+                           ["md-heading", "title-2"], raw=stripped[2:])
             elif stripped.startswith("> "):
                 add_markup(f"<i>{self._md_inline(stripped[2:])}</i>",
-                           ["dim-label"])
+                           ["dim-label"], raw=stripped[2:])
             elif re.match(r"^[-*+]\s+", stripped):
-                add_markup("•  " + self._md_inline(
-                    re.sub(r"^[-*+]\s+", "", stripped)))
+                item = re.sub(r"^[-*+]\s+", "", stripped)
+                add_markup("•  " + self._md_inline(item), raw=item)
             else:
-                add_markup(self._md_inline(stripped))
+                add_markup(self._md_inline(stripped), raw=stripped)
 
         if in_code and code_lines:
             add_text("\n".join(code_lines), css_classes=["md-code"])
@@ -2349,7 +2359,7 @@ class VoxCastWindow:
         )
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
-        header.set_title_widget(Gtk.Label(label="Résumé IA", css_classes=["title-4"]))
+        header.set_title_widget(Gtk.Label(label=_("Résumé IA"), css_classes=["title-4"]))
         toolbar.add_top_bar(header)
 
         loading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
@@ -2406,7 +2416,8 @@ class VoxCastWindow:
         return False
 
     def _show_summary_window(self, transcript: dict, md: str):
-        """Fenêtre affichant un résumé IA (généré ou chargé depuis le cache)."""
+        """Fenêtre affichant un résumé IA (généré ou chargé depuis le cache),
+        avec lecture audio TTS synchronisée (surlignage des paragraphes)."""
         self._last_summary = md
 
         dialog = Adw.Window(
@@ -2418,11 +2429,15 @@ class VoxCastWindow:
         )
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
-        header.set_title_widget(Gtk.Label(label="Résumé IA", css_classes=["title-4"]))
+        header.set_title_widget(Gtk.Label(label=_("Résumé IA"), css_classes=["title-4"]))
+        tts_btn = Gtk.Button(
+            icon_name="media-playback-start-symbolic",
+            tooltip_text=_("Lire le résumé à voix haute (TTS)"))
         copy_btn = Gtk.Button(icon_name="edit-copy-symbolic",
-                              tooltip_text="Copier le résumé (Markdown)")
-        copy_btn.connect("clicked", lambda *_: self._copy_to_clipboard(md))
+                              tooltip_text=_("Copier le résumé (Markdown)"))
+        copy_btn.connect("clicked", lambda *_a: self._copy_to_clipboard(md))
         header.pack_end(copy_btn)
+        header.pack_end(tts_btn)
         toolbar.add_top_bar(header)
 
         inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -2430,7 +2445,8 @@ class VoxCastWindow:
         inner.set_margin_bottom(24)
         inner.set_margin_start(24)
         inner.set_margin_end(24)
-        inner.append(self._build_md_view(md))
+        blocks: list = []  # [(label, texte_brut)] pour la synchro TTS
+        inner.append(self._build_md_view(md, collect=blocks))
 
         scrolled = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER,
@@ -2440,7 +2456,150 @@ class VoxCastWindow:
         scrolled.set_vexpand(True)
         toolbar.set_content(scrolled)
         dialog.set_content(toolbar)
+
+        dialog._tts = {
+            "transcript": transcript,
+            "btn": tts_btn,
+            "scrolled": scrolled,
+            "blocks": blocks,
+            "player": None,
+            "poll_id": None,
+            "current": -1,
+            "generating": False,
+        }
+        tts_btn.connect("clicked", lambda *_a: self._on_tts_toggle(dialog))
+        dialog.connect("close-request", self._on_summary_close)
         dialog.present()
+
+    # ------------------------------------------------------------------
+    # Lecture TTS du résumé + surlignage synchronisé
+    # ------------------------------------------------------------------
+
+    def _tts_path(self, transcript: dict) -> Path:
+        return self.transcripts_dir / ".summaries" / f"{transcript['name']}.mp3"
+
+    def _on_summary_close(self, dialog):
+        self._tts_stop(dialog)
+        return False  # laisse la fenêtre se fermer
+
+    def _tts_stop(self, dialog):
+        t = getattr(dialog, "_tts", None)
+        if not t:
+            return
+        if t["poll_id"] is not None:
+            GLib.source_remove(t["poll_id"])
+            t["poll_id"] = None
+        if t["player"] is not None:
+            try:
+                t["player"].set_paused(True)
+            except Exception:
+                pass
+            t["player"] = None
+        if t["current"] >= 0 and t["current"] < len(t["blocks"]):
+            try:
+                t["blocks"][t["current"]][0].remove_css_class("tts-current")
+            except Exception:
+                pass
+        t["current"] = -1
+        try:
+            t["btn"].set_icon_name("media-playback-start-symbolic")
+        except Exception:
+            pass
+
+    def _on_tts_toggle(self, dialog):
+        t = dialog._tts
+        if t["player"] is not None:
+            # pause / reprise
+            try:
+                paused = t["player"].get_paused()
+                t["player"].set_paused(not paused)
+                t["btn"].set_icon_name(
+                    "media-playback-pause-symbolic" if paused
+                    else "media-playback-start-symbolic")
+            except Exception:
+                self._tts_stop(dialog)
+            return
+        mp3 = self._tts_path(t["transcript"])
+        if not mp3.exists():
+            if t["generating"]:
+                return
+            t["generating"] = True
+            t["btn"].set_icon_name("content-loading-symbolic")
+            self.toast(_("Génération de la voix TTS..."), "info", 6)
+            md = self._load_summary(t["transcript"]) or ""
+
+            def work():
+                try:
+                    vtt.tts_generate(self.api_key, md, mp3,
+                                     voice_id=self.tts_voice or None)
+                    GLib.idle_add(self._tts_after_generate, dialog, True, "")
+                except Exception as e:
+                    GLib.idle_add(self._tts_after_generate, dialog, False, str(e))
+
+            threading.Thread(target=work, daemon=True).start()
+            return
+        self._tts_play(dialog)
+
+    def _tts_after_generate(self, dialog, ok: bool, err: str):
+        t = dialog._tts
+        t["generating"] = False
+        if not ok:
+            t["btn"].set_icon_name("media-playback-start-symbolic")
+            self.toast(f"TTS impossible : {err}", "error", 6)
+            return False
+        self._tts_play(dialog)
+        return False
+
+    def _tts_play(self, dialog):
+        t = dialog._tts
+        mp3 = self._tts_path(t["transcript"])
+        player = Gtk.MediaFile.new_for_filename(str(mp3))
+        player.play()
+        t["player"] = player
+        t["btn"].set_icon_name("media-playback-pause-symbolic")
+        t["poll_id"] = GLib.timeout_add(200, self._tts_poll, dialog)
+        # arrêt automatique en fin de lecture
+        dur = player.get_duration()  # µs
+        if dur > 0:
+            GLib.timeout_add(int(dur / 1000) + 800,
+                             lambda: (self._tts_stop(dialog), False)[1])
+
+    def _tts_poll(self, dialog):
+        """À chaque tick : position -> paragraphe courant -> surlignage + scroll."""
+        t = getattr(dialog, "_tts", None)
+        if t is None or t["player"] is None:
+            return False
+        try:
+            player = t["player"]
+            dur = player.get_duration()
+            ts = player.get_timestamp()
+            if dur <= 0:
+                return True
+            frac = max(0.0, min(1.0, ts / dur))
+            # part de caractères cumulée -> index de bloc
+            total = sum(max(1, len(raw)) for _b, raw in t["blocks"]) or 1
+            target = frac * total
+            acc = 0
+            idx = len(t["blocks"]) - 1
+            for i, (_b2, raw) in enumerate(t["blocks"]):
+                acc += max(1, len(raw))
+                if acc >= target:
+                    idx = i
+                    break
+            if idx != t["current"]:
+                if t["current"] >= 0:
+                    t["blocks"][t["current"]][0].remove_css_class("tts-current")
+                t["blocks"][idx][0].add_css_class("tts-current")
+                t["current"] = idx
+                adj = t["scrolled"].get_vadjustment()
+                n = len(t["blocks"])
+                adj.set_value((idx + 0.5) / n * (adj.get_upper() - adj.get_page_size()))
+            if ts >= dur:
+                self._tts_stop(dialog)
+                return False
+        except Exception:
+            return False
+        return True
 
     def _copy_to_clipboard(self, text: str):
         try:
@@ -2823,8 +2982,65 @@ class VoxCastWindow:
         proc_group.add(workers_row)
         page.add(proc_group)
 
+        # Voix TTS pour la lecture des résumés
+        tts_group = Adw.PreferencesGroup(
+            title=_("Lecture vocale (TTS)"),
+            description=_("Voix utilisée pour lire les résumés IA à voix haute"),
+        )
+        tts_row = Adw.ActionRow(title=_("Voix TTS"))
+        tts_model = Gtk.StringList()
+        tts_model.append(_("Voix par défaut du modèle"))
+        tts_row._voice_slugs = [""]
+        selected = 0
+        if self.tts_voice:
+            tts_model.append(self.tts_voice)
+            tts_row._voice_slugs.append(self.tts_voice)
+            selected = 1
+        self.tts_dropdown = Gtk.DropDown(
+            model=tts_model, selected=selected, valign=Gtk.Align.CENTER)
+        self.tts_dropdown.connect("notify::selected", self.on_tts_voice_changed)
+        tts_row.add_suffix(self.tts_dropdown)
+        tts_row.set_activatable_widget(self.tts_dropdown)
+        tts_group.add(tts_row)
+        page.add(tts_group)
+
+        def fill_voices():
+            if not self.api_key:
+                return
+            try:
+                voices = vtt.list_voices(self.api_key)
+            except Exception:
+                return
+            def apply():
+                current = self.tts_dropdown.get_selected()
+                cur_slug = (tts_row._voice_slugs[current]
+                            if current < len(tts_row._voice_slugs) else "")
+                while tts_model.get_n_items() > 1:
+                    tts_model.remove(1)
+                tts_row._voice_slugs = [""]
+                sel = 0
+                for i, v in enumerate(voices):
+                    slug = v.get("slug") or v.get("id") or ""
+                    name = v.get("name") or slug
+                    tts_model.append(f"{name} ({slug})")
+                    tts_row._voice_slugs.append(slug)
+                    if slug and slug == cur_slug:
+                        sel = i + 1
+                self.tts_dropdown.set_selected(sel)
+                return False
+            GLib.idle_add(apply)
+
+        threading.Thread(target=fill_voices, daemon=True).start()
+
         dialog.add(page)
         dialog.present()
+
+    def on_tts_voice_changed(self, dropdown, _param):
+        idx = dropdown.get_selected()
+        row = dropdown.get_ancestor(Adw.ActionRow)
+        slugs = getattr(row, "_voice_slugs", [""]) if row else [""]
+        self.tts_voice = slugs[idx] if idx < len(slugs) else ""
+        self.save_settings()
 
     def on_theme_changed(self, dropdown, _param):
         idx = dropdown.get_selected()
@@ -2961,6 +3177,8 @@ class VoxCastWindow:
             "color_scheme": self.color_scheme,
             "custom_models": self.custom_models,
             "model_profile": self.model_profile,
+            "tts_voice": self.tts_voice,
+            "lang": LANG,
         }
         settings_path = APP_DIR / "settings.json"
         with open(settings_path, "w") as f:
@@ -2979,6 +3197,10 @@ class VoxCastWindow:
                 self.color_scheme = settings.get("color_scheme", "default")
                 self.custom_models = settings.get("custom_models", []) or []
                 self.model_profile = settings.get("model_profile")
+                self.tts_voice = settings.get("tts_voice", "") or ""
+                global_lang = settings.get("lang", "fr")
+                if global_lang in ("fr", "en"):
+                    globals()["LANG"] = global_lang
         except (FileNotFoundError, json.JSONDecodeError):
             pass
 
