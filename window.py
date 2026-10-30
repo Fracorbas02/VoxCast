@@ -4,12 +4,15 @@ VoxCast - Fenêtre principale GTK4
 Interface moderne avec GTK4 + Libadwaita pour une intégration native sous GNOME.
 """
 
+import html
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -228,6 +231,7 @@ class QueueItem:
         self.status = STATUS_PENDING
         self.error = None
         self.progress = 0.0
+        self.duration: Optional[float] = None  # durée audio en secondes (pour l'ETA)
         self.output_path: Optional[Path] = None
         self.row_widget: Optional[Gtk.Widget] = None
         self.status_label: Optional[Gtk.Label] = None
@@ -1061,65 +1065,85 @@ class VoxCastWindow:
         self.queue_thread.start()
 
     def _process_queue(self):
-        """Traite la file d'attente séquentiellement.
+        """Traite la file d'attente en parallèle (max_workers threads).
         Les logs du pipeline vont dans le shell + voxcast.log via logging."""
+
+        def process_one(item: QueueItem):
+            if self.cancelled:
+                item.status = STATUS_CANCELLED
+                GLib.idle_add(self._update_queue_item_status, item)
+                GLib.idle_add(self._update_global_progress)
+                return
+
+            item.status = STATUS_RUNNING
+            item.progress = 0.0
+            GLib.idle_add(self._update_queue_item_status, item)
+            GLib.idle_add(self._update_global_progress)
+            GLib.idle_add(self.update_status,
+                f"Traitement : {Path(item.source).name[:40]}", "yellow")
+            self.log_message(f"--- {item.source} ---")
+
+            opts = item.options
+            try:
+                output_path = vtt.run_pipeline(
+                    source=item.source,
+                    api_key=self.api_key,
+                    language=opts.get("language"),
+                    diarize=opts.get("diarize", False),
+                    timestamp_granularities=opts.get("timestamp_granularities"),
+                    context_bias=opts.get("context_bias"),
+                    output_name=opts.get("output_name"),
+                    keep_audio=opts.get("keep_audio", False),
+                    start=opts.get("start"),
+                    end=opts.get("end"),
+                    is_local_file=item.is_local,
+                    transcripts_dir=self.transcripts_dir,
+                    export_srt_file=opts.get("export_srt", False),
+                    export_vtt_file=opts.get("export_vtt", False),
+                    progress_callback=lambda f, msg, it=item: GLib.idle_add(self._on_item_progress, it, f, msg),
+                    cancel_check=lambda: self.cancelled,
+                    model=opts.get("model"),
+                    base_url=opts.get("base_url"),
+                    model_api_key=opts.get("model_api_key"),
+                )
+                item.status = STATUS_DONE
+                item.output_path = output_path
+                GLib.idle_add(self.toast, f"Transcription terminée : {output_path.name}",
+                    "success")
+                GLib.idle_add(self._send_notification,
+                    "Transcription terminée", output_path.name)
+                self.log_message(f"Terminé: {output_path.name}")
+
+            except InterruptedError:
+                item.status = STATUS_CANCELLED
+                GLib.idle_add(self.toast, "Transcription annulée", "info")
+                self.log_message("Annulé")
+            except Exception as e:
+                item.status = STATUS_ERROR
+                item.error = str(e)
+                GLib.idle_add(self.toast, f"Erreur : {e}", "error", 6)
+                GLib.idle_add(self._send_notification,
+                    "Échec de la transcription", f"{Path(item.source).name} : {e}")
+                self.log_message(f"Erreur: {e}")
+            finally:
+                GLib.idle_add(self._update_queue_item_status, item)
+                GLib.idle_add(self._update_global_progress)
+
         try:
             pending = [q for q in self.queue if q.status == STATUS_PENDING]
             total = len(pending)
+            self._queue_total = total
 
-            for qi, item in enumerate(pending, 1):
-                if self.cancelled:
-                    item.status = STATUS_CANCELLED
-                    GLib.idle_add(self._update_queue_item_status, item)
-                    continue
+            workers = max(1, min(self.max_workers, total))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(process_one, pending))
 
-                item.status = STATUS_RUNNING
-                item.progress = 0.0
-                GLib.idle_add(self._update_queue_item_status, item)
-
-                GLib.idle_add(self.update_status,
-                    f"Traitement {qi}/{total}: {item.source[:40]}...", "yellow")
-                self.log_message(f"--- [{qi}/{total}] {item.source} ---")
-
-                opts = item.options
-                try:
-                    output_path = vtt.run_pipeline(
-                        source=item.source,
-                        api_key=self.api_key,
-                        language=opts.get("language"),
-                        diarize=opts.get("diarize", False),
-                        timestamp_granularities=opts.get("timestamp_granularities"),
-                        context_bias=opts.get("context_bias"),
-                        output_name=opts.get("output_name"),
-                        keep_audio=opts.get("keep_audio", False),
-                        start=opts.get("start"),
-                        end=opts.get("end"),
-                        is_local_file=item.is_local,
-                        transcripts_dir=self.transcripts_dir,
-                        export_srt_file=opts.get("export_srt", False),
-                        export_vtt_file=opts.get("export_vtt", False),
-                        progress_callback=lambda f, msg, it=item: GLib.idle_add(self._on_item_progress, it, f, msg),
-                        cancel_check=lambda: self.cancelled,
-                    )
-                    item.status = STATUS_DONE
-                    item.output_path = output_path
-                    GLib.idle_add(self.toast, f"Transcription terminée : {output_path.name}",
-                        "success")
-                    self.log_message(f"Terminé: {output_path.name}")
-
-                except InterruptedError:
-                    item.status = STATUS_CANCELLED
-                    GLib.idle_add(self.toast, "Transcription annulée", "info")
-                    self.log_message("Annulé")
-                except Exception as e:
-                    item.status = STATUS_ERROR
-                    item.error = str(e)
-                    GLib.idle_add(self.toast, f"Erreur : {e}", "error", 6)
-                    self.log_message(f"Erreur: {e}")
-
-                GLib.idle_add(self._update_queue_item_status, item)
-
-            GLib.idle_add(self.update_status, "File terminée", "green")
+            if self.cancelled:
+                GLib.idle_add(self.update_status, "File annulée", "yellow")
+            else:
+                GLib.idle_add(self.update_status, "File terminée", "green")
+                GLib.idle_add(self._send_notification,
+                    "File d'attente terminée", f"{total} élément(s) traité(s)")
 
         except Exception as e:
             self.log_message(f"Erreur fatale: {e}")
@@ -1127,36 +1151,92 @@ class VoxCastWindow:
         finally:
             GLib.idle_add(self._on_queue_done)
 
+    def _update_global_progress(self):
+        """Progression globale = (terminés + somme des progressions en cours) / total."""
+        if not self._queue_total:
+            return
+        done = sum(1 for q in self.queue if q.status == STATUS_DONE)
+        running = sum(q.progress for q in self.queue if q.status == STATUS_RUNNING)
+        cancelled = sum(1 for q in self.queue if q.status == STATUS_CANCELLED)
+        frac = (done + cancelled + running) / self._queue_total
+        self.progress_bar.set_fraction(min(frac, 1.0))
+        self._update_eta()
+
+    def _update_eta(self):
+        """
+        ETA global : (audio restant de toute la file) × vitesse apprise / workers.
+        La vitesse apprise vient des transcriptions déjà terminées (voir
+        video_to_text.get_learned_speed) — bien plus fidèle qu'une constante.
+        """
+        if not self.running or not self._queue_total:
+            self.eta_label.set_label("")
+            return
+        workers = max(1, min(self.max_workers, self._queue_total))
+        remaining_seconds = 0.0
+        known = False
+        for q in self.queue:
+            if q.duration is None:
+                continue
+            known = True
+            # vitesse apprise propre au modèle de chaque item
+            key = (f"{q.options.get('base_url') or 'mistral'}::"
+                   f"{q.options.get('model') or vtt.MISTRAL_MODEL}")
+            try:
+                speed = vtt.get_learned_speed(key)
+            except Exception:
+                speed = vtt.TRANSCRIBE_SPEED_DEFAULT
+            if q.status == STATUS_PENDING:
+                remaining_seconds += q.duration * speed
+            elif q.status == STATUS_RUNNING:
+                remaining_seconds += q.duration * max(0.0, 1.0 - q.progress) * speed
+        if not known:
+            self.eta_label.set_label("")
+            return
+        eta = remaining_seconds / workers
+        self.eta_label.set_label(f"~{vtt.fmt_duration(eta)} restantes")
+
     def _update_queue_item_status(self, item: QueueItem):
-        """Met à jour le label de statut d'un item de la file."""
+        """Met à jour la pastille de statut d'un item de la file."""
         if item.status_label:
             item.status_label.set_label(STATUS_LABELS.get(item.status, item.status))
-            # Mettre à jour la couleur
-            for css in STATUS_COLORS.values():
-                item.status_label.remove_css_class(css)
-            css = STATUS_COLORS.get(item.status, "")
-            if css:
-                item.status_label.add_css_class(css)
+            for cls in PILL_CLASSES:
+                item.status_label.remove_css_class(cls)
+            item.status_label.add_css_class(f"pill-{item.status}")
+        if item.progress_bar:
+            item.progress_bar.set_visible(item.status == STATUS_RUNNING)
 
     def _on_item_progress(self, item: QueueItem, frac: float, message: str):
-        """Colle la barre de l'item ET le statut global sur l'activité réelle du pipeline."""
+        """Colle la barre de l'item sur l'activité réelle du pipeline,
+        et la barre globale sur l'agrégat de toute la file."""
         if not self.running:
             return
         item.progress = min(frac, 1.0)
         if item.progress_bar:
             item.progress_bar.set_visible(True)
             item.progress_bar.set_fraction(item.progress)
-        self.progress_bar.set_fraction(item.progress)
+        self._update_global_progress()
         if message:
             self.status_label.set_label(message)
 
     def _on_queue_done(self):
         self.running = False
         self.cancelled = False
+        self._queue_total = 0
         self.cancel_btn.set_sensitive(False)
         self.progress_bar.set_visible(False)
+        self.eta_label.set_label("")
         self._refresh_queue_list()
         self.refresh_transcripts_list()
+
+    def _send_notification(self, title: str, body: str):
+        """Notification système (Gio.Notification) — appelé via GLib.idle_add."""
+        try:
+            notif = Gio.Notification.new(title)
+            notif.set_body(body)
+            self._notif_counter += 1
+            self.app.send_notification(f"voxcast-{self._notif_counter}", notif)
+        except Exception as e:
+            self.log_message(f"Notification: {e}")
 
     def on_cancel_clicked(self, button=None):
         if self.running:

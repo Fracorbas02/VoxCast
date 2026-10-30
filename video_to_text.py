@@ -52,6 +52,7 @@ TRANSCRIBE_SPEED_DEFAULT = 0.15
 OUTPUT_DIR = Path(__file__).parent / "transcripts"
 TEMP_DIR = Path(__file__).parent / "downloads"
 CACHE_FILE = Path(__file__).parent / ".cache.json"
+STATS_FILE = Path(__file__).parent / ".stats.json"
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +202,112 @@ def get_video_info_cached(url: str, use_cache: bool = True) -> dict:
 
 def estimate_cost(duration_seconds: float) -> float:
     return (duration_seconds / 60) * COST_PER_MIN
+
+
+# ---------------------------------------------------------------------------
+# Statistiques apprises (vitesse réelle de transcription Mistral)
+# ---------------------------------------------------------------------------
+
+def load_stats() -> dict:
+    try:
+        with open(STATS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"runs": [], "speed_ema": None}
+
+
+def save_stats(stats: dict):
+    with open(STATS_FILE, "w") as f:
+        json.dump(stats, f, indent=2)
+
+
+def default_model_key() -> str:
+    """Clé d'identification du modèle courant pour les stats de vitesse."""
+    return f"mistral::{MISTRAL_MODEL}"
+
+
+def get_learned_speed(model_key: Optional[str] = None) -> float:
+    """
+    Vitesse apprise : secondes de calcul par seconde d'audio.
+    Moyenne glissante (EMA) sur les transcriptions déjà terminées avec ce
+    modèle, sinon la valeur par défaut.
+    """
+    model_key = model_key or default_model_key()
+    stats = load_stats()
+    if stats.get("model") != model_key:
+        return TRANSCRIBE_SPEED_DEFAULT  # stats d'un autre modèle : on repart à zéro
+    ema = stats.get("speed_ema")
+    if ema and ema > 0:
+        return float(ema)
+    return TRANSCRIBE_SPEED_DEFAULT
+
+
+def record_transcription_stats(audio_seconds: float, elapsed_seconds: float,
+                               model_key: Optional[str] = None):
+    """Enregistre une transcription terminée et met à jour la vitesse apprise."""
+    if audio_seconds <= 0 or elapsed_seconds <= 0:
+        return
+    model_key = model_key or default_model_key()
+    stats = load_stats()
+    runs = stats.get("runs", [])
+    runs.append({
+        "audio_seconds": round(audio_seconds, 1),
+        "elapsed_seconds": round(elapsed_seconds, 1),
+    })
+    stats["runs"] = runs[-50:]  # on garde les 50 dernières mesures
+    stats["model"] = model_key  # les vitesses ne sont valables que pour ce modèle
+    speed = elapsed_seconds / audio_seconds
+    ema = stats.get("speed_ema")
+    stats["speed_ema"] = round(speed if not ema else 0.7 * float(ema) + 0.3 * speed, 5)
+    save_stats(stats)
+    print(f"Vitesse apprise: {stats['speed_ema']:.3f}s calcul / s audio "
+          f"(moyenne sur {len(stats['runs'])} transcription(s))")
+
+
+# ---------------------------------------------------------------------------
+# Playlists YouTube
+# ---------------------------------------------------------------------------
+
+def is_playlist_url(url: str) -> bool:
+    """True si l'URL désigne une playlist (et pas une vidéo seule)."""
+    if not url.startswith("http"):
+        return False
+    return "list=" in url and "watch" not in url and "/shorts/" not in url
+
+
+def get_playlist_entries(url: str, use_cache: bool = True) -> dict:
+    """
+    Retourne {"title": str, "entries": [{id, title, duration, url}, ...]}
+    pour une playlist YouTube (extraction 'flat', mise en cache).
+    """
+    cache = load_cache()
+    key = cache_key(url) + "#playlist"
+    if use_cache and key in cache:
+        print("(playlist depuis le cache)")
+        return cache[key]
+    print("(récupération de la playlist...)")
+    with yt_dlp.YoutubeDL({
+        "quiet": True, "no_warnings": True, "extract_flat": True,
+    }) as ydl:
+        info = ydl.extract_info(url, download=False)
+    entries = []
+    for e in info.get("entries", []) or []:
+        vid = e.get("id", "")
+        if not vid:
+            continue
+        webpage = e.get("webpage_url") or e.get("url") or ""
+        if not webpage.startswith("http"):
+            webpage = f"https://www.youtube.com/watch?v={vid}"
+        entries.append({
+            "id": vid,
+            "title": e.get("title", vid),
+            "duration": e.get("duration") or 0,
+            "url": webpage,
+        })
+    result = {"title": info.get("title", "Playlist"), "entries": entries}
+    cache[key] = result
+    save_cache(cache)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -816,8 +923,10 @@ def run_pipeline(
         total_audio = sum(chunk_durations) or 1.0
 
         # Vitesse apprise : secondes de transcription par seconde d'audio,
+        # initialisée depuis l'historique des transcriptions passées puis
         # ajustée à chaque chunk terminé (lissage 50/50).
-        speed = TRANSCRIBE_SPEED_DEFAULT
+        speed = get_learned_speed()
+        transcribe_wall_start = time.monotonic()
         results = []
         total = len(audio_files)
         acc = 0.0
@@ -832,8 +941,8 @@ def run_pipeline(
             remaining = est + (total_audio - acc - chunk_dur) * speed
             label = "Transcription" if total == 1 else f"Transcription chunk {i}/{total}"
             rep.set(chunk_base,
-                    ceiling=chunk_base + chunk_span * 0.9,  # marge sous la cible
-                    rate=(chunk_span * 0.9) / est,          # arriver "à l'heure"
+                    ceiling=chunk_base + chunk_span * 0.95,  # marge sous la cible
+                    rate=(chunk_span * 0.95) / est,           # arriver "à l'heure"
                     message=f"{label} — ~{fmt_duration(remaining)} restantes")
             rep.start_ticker()
 
@@ -859,6 +968,12 @@ def run_pipeline(
             results.append((result, offset))
             text = result.get("text", "")
             _log(f"Chunk {i}/{total} transcrit: {len(text)} caractères")
+
+        # Apprentissage : on enregistre le temps réel de la phase de transcription
+        transcribe_elapsed = time.monotonic() - transcribe_wall_start
+        model_key = f"{base_url or 'mistral'}::{model or MISTRAL_MODEL}"
+        record_transcription_stats(total_audio, transcribe_elapsed,
+                                   model_key=model_key)
 
         # --- Étape 3 : Sauvegarde (95% → 100%) ---
         _log("Sauvegarde...")
