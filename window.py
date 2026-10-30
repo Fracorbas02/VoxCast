@@ -244,6 +244,9 @@ TRANSLATIONS = {
         _("Nombre d'éléments traités simultanément"): "Number of items processed simultaneously",
         "Voix TTS": "TTS voice",
         "TTS": "TTS",
+        _("Playlist détectée — cliquez sur « Ajouter » pour choisir les vidéos."):
+            "Playlist detected — click \"Add\" to pick videos.",
+        _("Récupération des informations..."): "Fetching info...",
         _("Annulé (délai dépassé)"): "Cancelled (timeout)",
         _("Délai dépassé ({s}s) — le backend ne répond plus, discussion annulée"):
             "Timeout ({s}s) — the backend is not responding, chat cancelled",
@@ -1072,46 +1075,63 @@ class VoxCastWindow:
     # ========================================================================
 
     def _show_cost_estimate(self, source: str, is_local: bool):
-        """Affiche une estimation du coût et de la durée, et auto-remplit le nom."""
+        """Estimation durée/coût + auto-remplissage du nom.
+
+        Le fetch réseau (yt-dlp pour les URLs, ffprobe pour les fichiers
+        locaux) est exécuté dans un thread : le thread GTK n'est jamais
+        bloqué. Le résultat n'est appliqué que si la source n'a pas changé
+        entre-temps."""
         if not source:
             self.cost_label.set_label("")
             return
+        # cas purement local (pas de réseau) : réponse immédiate
+        if source.startswith("http") and vtt.is_playlist_url(source):
+            self.cost_label.set_label(
+                _("Playlist détectée — cliquez sur « Ajouter » pour choisir les vidéos."))
+            return
+        self._source_req = getattr(self, "_source_req", 0) + 1
+        req = self._source_req
+        self.cost_label.set_label(_("Récupération des informations..."))
 
-        try:
-            if is_local and Path(source).exists():
-                duration = vtt.get_audio_duration_seconds(Path(source))
-                cost = vtt.estimate_cost(duration)
-                self.cost_label.set_label(
-                    f"Durée: {vtt.format_timestamp(duration)} | "
-                    f"Coût estimé: ${cost:.2f}"
-                )
-                # Auto-remplir avec le nom du fichier
-                if not self.name_entry.get_text().strip():
-                    auto_name = vtt.sanitize_filename(Path(source).stem)
-                    self.name_entry.set_text(auto_name)
-            elif source.startswith("http"):
-                if vtt.is_playlist_url(source):
-                    self.cost_label.set_label(
-                        "Playlist détectée — cliquez sur « Ajouter » pour choisir les vidéos.")
-                    return
-                # Pour les URLs, on fetch les infos (avec cache)
-                info = vtt.get_video_info_cached(source)
-                duration = info.get("duration", 0)
-                cost = vtt.estimate_cost(duration)
-                self.cost_label.set_label(
-                    f"Durée: {vtt.format_timestamp(duration)} | "
-                    f"Coût estimé: ${cost:.2f}"
-                )
-                # Auto-remplir avec le titre de la vidéo
-                if not self.name_entry.get_text().strip():
-                    title = info.get("title", "")
-                    if title:
-                        auto_name = vtt.sanitize_filename(title)
-                        self.name_entry.set_text(auto_name)
-            else:
-                self.cost_label.set_label("")
-        except Exception:
-            self.cost_label.set_label("")
+        def work():
+            label = ""
+            auto_name = ""
+            try:
+                if is_local and Path(source).exists():
+                    duration = vtt.get_audio_duration_seconds(Path(source))
+                    cost = vtt.estimate_cost(duration)
+                    label = (f"Durée: {vtt.format_timestamp(duration)} | "
+                             f"Coût estimé: ${cost:.2f}")
+                    if not self.name_entry.get_text().strip():
+                        auto_name = vtt.sanitize_filename(Path(source).stem)
+                elif source.startswith("http"):
+                    # Pour les URLs, on fetch les infos (avec cache)
+                    info = vtt.get_video_info_cached(source)
+                    duration = info.get("duration", 0)
+                    cost = vtt.estimate_cost(duration)
+                    label = (f"Durée: {vtt.format_timestamp(duration)} | "
+                             f"Coût estimé: ${cost:.2f}")
+                    if not self.name_entry.get_text().strip():
+                        title = info.get("title", "")
+                        if title:
+                            auto_name = vtt.sanitize_filename(title)
+            except Exception:
+                label = ""
+            GLib.idle_add(self._apply_cost_estimate, req, source, label, auto_name)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_cost_estimate(self, req: int, source: str, label: str,
+                             auto_name: str):
+        """Applique le résultat de l'estimation si la source est toujours d'actualité."""
+        if req != getattr(self, "_source_req", 0):
+            return False
+        if self.url_entry.get_text().strip() != source:
+            return False
+        self.cost_label.set_label(label)
+        if auto_name and not self.name_entry.get_text().strip():
+            self.name_entry.set_text(auto_name)
+        return False
 
     # ========================================================================
     # FILE D'ATTENTE
@@ -3594,9 +3614,28 @@ a {{ color: #3584e4; }}
     # ========================================================================
 
     def _on_source_changed(self):
-        """Gère le changement de source : lance l'estimation durée/coût."""
-        url = self.url_entry.get_text().strip()
+        """Réagit à chaque changement de la source sans bloquer l'UI :
+        - réponse visuelle immédiate (playlist détectée / « récupération... »)
+        - debounce de 600 ms avant l'estimation durée/coût, qui elle fait un
+          appel réseau yt-dlp exécuté dans un thread (voir _show_cost_estimate)."""
+        source = self.url_entry.get_text().strip()
+        if getattr(self, "_source_debounce_id", None) is not None:
+            GLib.source_remove(self._source_debounce_id)
+            self._source_debounce_id = None
+        if not source:
+            self.cost_label.set_label("")
+            return
+        if source.startswith("http") and vtt.is_playlist_url(source):
+            self.cost_label.set_label(
+                _("Playlist détectée — cliquez sur « Ajouter » pour choisir les vidéos."))
+        else:
+            self.cost_label.set_label(_("Récupération des informations..."))
+        self._source_debounce_id = GLib.timeout_add(600, self._launch_source_check)
+
+    def _launch_source_check(self):
+        self._source_debounce_id = None
         self._check_source_type()
+        return False
 
     def _ensure_api_key(self, on_success) -> bool:
         """
