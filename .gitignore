@@ -7,3 +7,4 @@ venv/
 voxccast.log
 settings.json
 .cache.json
+.stats.json
