@@ -711,10 +711,12 @@ def chat_complete(
     model: str = SUMMARY_MODEL,
     max_tokens: int = 8192,
     temperature: float = 0.3,
+    timeout_ms: int = 180_000,
 ) -> str:
-    """Appel chat completions Mistral (Mistral Large par défaut)."""
+    """Appel chat completions Mistral (Mistral Large par défaut).
+    timeout_ms : évite un blocage infini si le backend ne répond plus."""
     from mistralai.client import Mistral
-    client = Mistral(api_key=api_key)
+    client = Mistral(api_key=api_key, timeout_ms=timeout_ms)
     response = client.chat.complete(
         model=model,
         messages=messages,
@@ -871,6 +873,10 @@ CHAT_SYSTEM_PROMPT = (
 )
 
 
+class ChatCancelled(Exception):
+    """Levée quand cancel_check() renvoie True (annulation demandée par l'UI)."""
+
+
 def chat_with_tools(
     api_key: str,
     context_text: str,
@@ -879,13 +885,34 @@ def chat_with_tools(
     model: str = SUMMARY_MODEL,
     progress_callback=None,
     max_tool_rounds: int = 4,
+    timeout_ms: int = 120_000,
+    cancel_check=None,
 ) -> tuple[str, list[dict]]:
     """
     Chat avec function calling : le modèle peut appeler l'outil web_search
     (exécuté localement via DuckDuckGo). Retourne (réponse, history maj).
+
+    timeout_ms : timeout HTTP par appel (évite un blocage infini si le
+    backend ne répond plus). cancel_check : fonction appelée entre chaque
+    tour ; si elle renvoie True, lève ChatCancelled.
     """
+    import httpx
     from mistralai.client import Mistral
-    client = Mistral(api_key=api_key)
+    client = Mistral(api_key=api_key, timeout_ms=timeout_ms)
+
+    def _check_cancel():
+        if cancel_check is not None and cancel_check():
+            raise ChatCancelled("Annulé par l'utilisateur")
+
+    def _complete(**kwargs):
+        _check_cancel()
+        try:
+            return client.chat.complete(**kwargs)
+        except httpx.HTTPError as e:
+            raise RuntimeError(
+                f"Appel API interrompu ({type(e).__name__}, "
+                f"timeout {timeout_ms // 1000}s) : le backend ne répond plus"
+            ) from e
 
     # Compresse le contexte si énorme (map-reduce réutilisé)
     if len(context_text) > 90000:
@@ -907,8 +934,9 @@ def chat_with_tools(
     ]
 
     for round_nb in range(1, max_tool_rounds + 1):
+        _check_cancel()
         _progress(f"Réflexion... (tour {round_nb})")
-        resp = client.chat.complete(
+        resp = _complete(
             model=model, messages=messages,
             tools=[WEB_SEARCH_TOOL], tool_choice="auto", temperature=0.3,
         )
@@ -951,7 +979,8 @@ def chat_with_tools(
                 })
 
     # Dernier tour sans outil
-    resp = client.chat.complete(model=model, messages=messages, temperature=0.3)
+    _check_cancel()
+    resp = _complete(model=model, messages=messages, temperature=0.3)
     answer = resp.choices[0].message.content or ""
     messages.append({"role": "assistant", "content": answer})
     return answer, messages

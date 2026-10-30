@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -240,6 +241,11 @@ TRANSLATIONS = {
         _("Nombre d'éléments traités simultanément"): "Number of items processed simultaneously",
         "Voix TTS": "TTS voice",
         "TTS": "TTS",
+        _("Annulé (délai dépassé)"): "Cancelled (timeout)",
+        _("Délai dépassé ({s}s) — le backend ne répond plus, discussion annulée"):
+            "Timeout ({s}s) — the backend is not responding, chat cancelled",
+        _("réponse lente..."): "slow response...",
+        _("Erreur"): "Error",
         "Aucune": "None",
         "Vue d'ensemble": "Overview",
         "Par mois": "Per month",
@@ -2961,7 +2967,9 @@ class VoxCastWindow:
         toolbar.set_content(content)
         dialog.set_content(toolbar)
 
-        state = {"history": self._load_chat_history(transcript), "busy": False}
+        state = {"history": self._load_chat_history(transcript), "busy": False,
+                 "cancel": False, "started": 0.0, "last_msg": "",
+                 "watch_id": None}
         dialog._chat_state = state
         dialog._chat_transcript = transcript
         dialog._chat_status = status
@@ -2981,10 +2989,18 @@ class VoxCastWindow:
                 return
             entry.set_text("")
             state["busy"] = True
+            state["cancel"] = False
+            state["started"] = time.monotonic()
+            state["last_msg"] = _("Réflexion...")
             self._add_chat_bubble(self._chat_box, "user", q)
             state["history"].append({"role": "user", "content": q})
-            status.set_label(_("Réflexion..."))
+            status.set_label(state["last_msg"])
             GLib.idle_add(scroll_bottom)
+            # watchdog : affiche le temps écoulé et annule après 10 min
+            if state["watch_id"] is not None:
+                GLib.source_remove(state["watch_id"])
+            state["watch_id"] = GLib.timeout_add(
+                5000, self._chat_watchdog, dialog, 600)
 
             def work():
                 try:
@@ -2992,10 +3008,14 @@ class VoxCastWindow:
                     answer, new_hist = vtt.chat_with_tools(
                         self.api_key, text, state["history"][:-1], q,
                         progress_callback=lambda msg: GLib.idle_add(
-                            status.set_label, msg),
+                            self._on_chat_progress, dialog, msg),
+                        cancel_check=lambda: state["cancel"],
                     )
                     GLib.idle_add(self._on_chat_answer, dialog, answer,
                                   new_hist)
+                except vtt.ChatCancelled:
+                    GLib.idle_add(self._on_chat_error, dialog,
+                                  _("Annulé (délai dépassé)"))
                 except Exception as e:
                     GLib.idle_add(self._on_chat_error, dialog, str(e))
 
@@ -3006,9 +3026,47 @@ class VoxCastWindow:
         dialog.present()
         GLib.idle_add(scroll_bottom)
 
+    def _on_chat_progress(self, dialog, msg: str):
+        """Mémorise le dernier message de progression (le watchdog y ajoute
+        le temps écoulé)."""
+        state = dialog._chat_state
+        state["last_msg"] = msg
+        if state["busy"] and state["started"]:
+            elapsed = time.monotonic() - state["started"]
+            dialog._chat_status.set_label(f"{msg} — {int(elapsed)}s")
+        else:
+            dialog._chat_status.set_label(msg)
+        return False
+
+    def _chat_watchdog(self, dialog, max_seconds: int):
+        """Toutes les 5s pendant une réponse : affiche le temps écoulé et
+        annule (avec alerte) si le backend ne répond plus depuis trop longtemps."""
+        state = dialog._chat_state
+        if not state["busy"]:
+            state["watch_id"] = None
+            return False
+        elapsed = time.monotonic() - state["started"]
+        if elapsed > max_seconds:
+            state["cancel"] = True
+            state["watch_id"] = None
+            self._on_chat_error(
+                dialog, _("Délai dépassé ({s}s) — le backend ne répond plus, "
+                          "discussion annulée").format(s=max_seconds))
+            return False
+        if elapsed > 60:
+            # alerte visuelle douce dès 1 min sans réponse
+            dialog._chat_status.set_label(
+                f"{state['last_msg']} — {int(elapsed)}s "
+                f"({_('réponse lente...')})")
+        return True
+
     def _on_chat_answer(self, dialog, answer: str, history: list[dict]):
-        dialog._chat_state["busy"] = False
-        dialog._chat_state["history"] = history
+        state = dialog._chat_state
+        if state.get("watch_id") is not None:
+            GLib.source_remove(state["watch_id"])
+            state["watch_id"] = None
+        state["busy"] = False
+        state["history"] = history
         self._add_chat_bubble(self._chat_box, "assistant", answer)
         dialog._chat_status.set_label("")
         self._save_chat_history(dialog._chat_transcript, history)
@@ -3017,9 +3075,15 @@ class VoxCastWindow:
         return False
 
     def _on_chat_error(self, dialog, message: str):
-        dialog._chat_state["busy"] = False
+        state = dialog._chat_state
+        if state.get("watch_id") is not None:
+            GLib.source_remove(state["watch_id"])
+            state["watch_id"] = None
+        was_busy = state["busy"]
+        state["busy"] = False
         dialog._chat_status.set_label(f"{_('Erreur')} : {message}")
-        self.toast(f"Chat impossible : {message}", "error", 6)
+        if was_busy:
+            self.toast(f"Chat impossible : {message}", "error", 8)
         return False
 
     # ========================================================================
