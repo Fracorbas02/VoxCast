@@ -492,6 +492,24 @@ class VoxCastWindow:
         # ===== Options avancées (repliées par défaut) =====
         options = Adw.ExpanderRow(title="Options avancées")
 
+        # Modèle de transcription (presets Mistral + modèles perso)
+        model_row = Adw.ActionRow(
+            title="Modèle de transcription",
+            subtitle="Preset Mistral ou API perso (compatible /v1/audio/transcriptions)",
+        )
+        self.model_dropdown = Gtk.DropDown(valign=Gtk.Align.CENTER)
+        self.model_dropdown.connect("notify::selected", self.on_model_changed)
+        self._rebuild_model_dropdown()
+        manage_btn = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER,
+                                tooltip_text="Gérer les modèles personnalisés")
+        manage_btn.connect("clicked", self.on_manage_models)
+        model_suffix = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+        model_suffix.append(self.model_dropdown)
+        model_suffix.append(manage_btn)
+        model_row.add_suffix(model_suffix)
+        model_row.set_activatable_widget(self.model_dropdown)
+        options.add_row(model_row)
+
         # Nom de sortie
         name_row = Adw.EntryRow(title="Nom de sortie (auto si vide)")
         self.name_entry = name_row
@@ -829,21 +847,171 @@ class VoxCastWindow:
                 self._check_source_type()
         dialog.destroy()
 
-    def on_add_to_queue(self, button=None):
-        """Ajoute l'élément courant à la file d'attente."""
-        source = self.url_entry.get_text().strip()
-        if not source:
-            self.toast("Veuillez entrer une URL ou un fichier.")
+    # ========================================================================
+    # MODÈLES DE TRANSCRIPTION (presets Mistral + perso)
+    # ========================================================================
+
+    def _model_profiles(self) -> list[dict]:
+        """Liste des profils de modèle : presets Mistral puis modèles perso."""
+        profiles = [
+            {"label": lbl, "model": mid, "base_url": None, "api_key": None}
+            for mid, lbl in vtt.MISTRAL_TRANSCRIBE_MODELS
+        ]
+        for cm in self.custom_models:
+            profiles.append({
+                "label": f"{cm.get('name') or cm['model']} · {cm.get('base_url') or 'custom'}",
+                "model": cm["model"],
+                "base_url": cm.get("base_url") or None,
+                "api_key": cm.get("api_key") or None,
+            })
+        return profiles
+
+    def _rebuild_model_dropdown(self):
+        profiles = self._model_profiles()
+        model = Gtk.StringList()
+        for p in profiles:
+            model.append(p["label"])
+        self.model_dropdown.set_model(model)
+        idx = 0
+        if self.model_profile:
+            for i, p in enumerate(profiles):
+                if (p["model"] == self.model_profile.get("model")
+                        and (p["base_url"] or None) == (self.model_profile.get("base_url") or None)):
+                    idx = i
+                    break
+        self.model_dropdown.set_selected(idx)
+
+    def _selected_profile(self) -> dict:
+        profiles = self._model_profiles()
+        idx = self.model_dropdown.get_selected()
+        if 0 <= idx < len(profiles):
+            return profiles[idx]
+        return profiles[0]
+
+    def on_model_changed(self, dropdown, _param):
+        profile = self._selected_profile()
+        if profile:
+            self.model_profile = {
+                "label": profile["label"],
+                "model": profile["model"],
+                "base_url": profile["base_url"],
+                "api_key": profile["api_key"],
+            }
+            self.save_settings()
+
+    def on_manage_models(self, button=None):
+        """Dialogue de gestion des modèles perso (ajout / suppression)."""
+        dialog = Adw.Window(
+            transient_for=self.window,
+            modal=True,
+            title="Modèles de transcription",
+            default_width=580,
+            default_height=620,
+        )
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Gtk.Label(label="Modèles de transcription",
+                                           css_classes=["title-4"]))
+        toolbar.add_top_bar(header)
+
+        page = Adw.PreferencesPage()
+
+        preset_group = Adw.PreferencesGroup(
+            title="Mistral (API officielle)",
+            description="Sélectionnables dans la liste déroulante « Modèle de transcription »")
+        for mid, lbl in vtt.MISTRAL_TRANSCRIBE_MODELS:
+            preset_group.add(Adw.ActionRow(title=lbl, subtitle=mid))
+        page.add(preset_group)
+
+        self._custom_group = Adw.PreferencesGroup(
+            title="Mes modèles perso",
+            description="Endpoints compatibles /v1/audio/transcriptions (Groq, OpenAI, etc.)")
+        page.add(self._custom_group)
+        self._custom_rows = []
+        self._fill_custom_models_group()
+
+        add_group = Adw.PreferencesGroup(title="Ajouter un modèle perso")
+        self._cm_name = Adw.EntryRow(title="Nom (ex: Groq Whisper)")
+        self._cm_model = Adw.EntryRow(title="Model ID (ex: whisper-large-v3)")
+        self._cm_url = Adw.EntryRow(title="URL de base de l'API (ex: https://api.groq.com)")
+        key_row = Adw.ActionRow(title="Clé API du fournisseur")
+        self._cm_key = Gtk.PasswordEntry(valign=Gtk.Align.CENTER, width_chars=24)
+        key_row.add_suffix(self._cm_key)
+        key_row.set_activatable_widget(self._cm_key)
+        for row in (self._cm_name, self._cm_model, self._cm_url, key_row):
+            add_group.add(row)
+        add_btn = Gtk.Button(label="Ajouter le modèle",
+                             css_classes=["suggested-action"],
+                             halign=Gtk.Align.END, margin_top=8, margin_bottom=8,
+                             margin_end=12)
+        add_btn.connect("clicked", self._on_add_custom_model)
+        add_group.add(add_btn)
+        page.add(add_group)
+
+        scrolled = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            child=page,
+        )
+        scrolled.set_vexpand(True)
+        toolbar.set_content(scrolled)
+        dialog.set_content(toolbar)
+        dialog.present()
+
+    def _fill_custom_models_group(self):
+        for row in getattr(self, "_custom_rows", []):
+            self._custom_group.remove(row)
+        self._custom_rows = []
+        for i, cm in enumerate(self.custom_models):
+            row = Adw.ActionRow(
+                title=cm.get("name") or cm["model"],
+                subtitle=f"{cm['model']} @ {cm.get('base_url') or '-'}")
+            del_btn = Gtk.Button(icon_name="user-trash-symbolic",
+                                 valign=Gtk.Align.CENTER,
+                                 css_classes=["destructive-action"],
+                                 tooltip_text="Supprimer ce modèle")
+            del_btn.connect("clicked", lambda *_b, idx=i: self._on_delete_custom_model(idx))
+            row.add_suffix(del_btn)
+            self._custom_group.add(row)
+            self._custom_rows.append(row)
+
+    def _on_add_custom_model(self, button=None):
+        name = self._cm_name.get_text().strip()
+        model = self._cm_model.get_text().strip()
+        base_url = self._cm_url.get_text().strip()
+        api_key = self._cm_key.get_text().strip()
+        if not model or not base_url:
+            self.toast("Model ID et URL de base requis.", "error")
             return
+        self.custom_models.append({
+            "name": name or model,
+            "model": model,
+            "base_url": base_url,
+            "api_key": api_key,
+        })
+        self.save_settings()
+        self._rebuild_model_dropdown()
+        self._fill_custom_models_group()
+        for r in (self._cm_name, self._cm_model, self._cm_url, self._cm_key):
+            r.set_text("")
+        self.toast(f"Modèle ajouté : {name or model}", "success")
 
-        is_local = not source.startswith("http")
+    def _on_delete_custom_model(self, index: int):
+        if 0 <= index < len(self.custom_models):
+            removed = self.custom_models.pop(index)
+            # Si le profil supprimé était sélectionné, retomber sur le preset par défaut
+            if (self.model_profile
+                    and self.model_profile.get("model") == removed["model"]
+                    and (self.model_profile.get("base_url") or None) == (removed.get("base_url") or None)):
+                self.model_profile = None
+            self.save_settings()
+            self._rebuild_model_dropdown()
+            self._fill_custom_models_group()
+            self.toast(f"Modèle supprimé : {removed.get('name') or removed['model']}")
 
-        # Vérifier que le fichier existe si local
-        if is_local and not Path(source).exists():
-            self.toast(f"Fichier introuvable : {source}", "error")
-            return
-
-        # Récupérer les options
+    def _collect_options(self, output_name: Optional[str] = None) -> dict:
+        """Récupère les options courantes du formulaire."""
+        profile = self._selected_profile()
         lang_idx = self.lang_dropdown.get_selected()
         language = LANGUAGES[lang_idx][0]
         if language == "auto":
@@ -860,20 +1028,55 @@ class VoxCastWindow:
         bias_text = self.bias_entry.get_text().strip()
         context_bias = bias_text.split() if bias_text else None
 
-        options = {
+        return {
             "language": language,
             "diarize": self.diarize_switch.get_active(),
             "timestamp_granularities": timestamp_granularities,
             "context_bias": context_bias,
-            "output_name": self.name_entry.get_text().strip() or None,
+            "output_name": output_name or self.name_entry.get_text().strip() or None,
             "keep_audio": self.keep_switch.get_active(),
             "start": start,
             "end": end,
             "export_srt": self.srt_switch.get_active(),
             "export_vtt": self.vtt_switch.get_active(),
+            "model": profile["model"],
+            "base_url": profile["base_url"],
+            "model_api_key": profile["api_key"],
         }
 
+    def _probe_duration(self, source: str, is_local: bool) -> Optional[float]:
+        """Durée audio en secondes (sonde ffprobe ou métadonnées YouTube cachées)."""
+        try:
+            if is_local:
+                return vtt.get_audio_duration_seconds(Path(source))
+            info = vtt.get_video_info_cached(source)
+            return info.get("duration") or None
+        except Exception:
+            return None
+
+    def on_add_to_queue(self, button=None):
+        """Ajoute l'élément courant à la file d'attente."""
+        source = self.url_entry.get_text().strip()
+        if not source:
+            self.toast("Veuillez entrer une URL ou un fichier.")
+            return
+
+        is_local = not source.startswith("http")
+
+        # Vérifier que le fichier existe si local
+        if is_local and not Path(source).exists():
+            self.toast(f"Fichier introuvable : {source}", "error")
+            return
+
+        # Playlist YouTube -> dialogue de sélection des vidéos
+        if not is_local and vtt.is_playlist_url(source):
+            self._open_playlist_dialog(source)
+            return
+
+        options = self._collect_options()
+
         item = QueueItem(source=source, is_local=is_local, options=options)
+        item.duration = self._probe_duration(source, is_local)
         self.queue.append(item)
         self._refresh_queue_list()
 
@@ -2307,6 +2510,10 @@ class VoxCastWindow:
         settings = {
             "api_key": self.api_key,
             "transcripts_dir": str(self.transcripts_dir),
+            "max_workers": self.max_workers,
+            "color_scheme": self.color_scheme,
+            "custom_models": self.custom_models,
+            "model_profile": self.model_profile,
         }
         settings_path = APP_DIR / "settings.json"
         with open(settings_path, "w") as f:

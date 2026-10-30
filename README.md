@@ -15,7 +15,7 @@ Le fichier de sortie est structuré pour être directement exploitable par un ou
 
 - Téléchargement audio via `yt-dlp` (MP3 128kbps, optimisé pour la parole)
 - **Support des fichiers audio locaux** (MP3, WAV, M4A, OGG, FLAC...) en plus de YouTube
-- Transcription via l'API Mistral Voxtral (`voxtral-mini-latest`)
+- Transcription via l'API Mistral Voxtral (`voxtral-small-transcribe-3-0`, surchargeable via `VOXCAST_TRANSCRIBE_MODEL`)
 - **Diarisation** optionnelle (identification des speakers)
 - **Timestamps** optionnels (par segment ou par mot)
 - **Context biasing** (jusqu'à 100 termes pour guider la transcription de noms propres)

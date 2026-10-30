@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 VoxCast - Télécharge l'audio d'une vidéo YouTube et le transcrit en texte
-via l'API Mistral Voxtral (voxtral-mini-latest / Voxtral Mini Transcribe 2).
+via l'API Mistral Voxtral (voxtral-small-transcribe-3-0 / Voxtral Small Transcribe 3).
 
 Pipeline:
     URL YouTube → yt-dlp (audio MP3) → Mistral Voxtral API → fichier texte
@@ -34,14 +34,34 @@ import yt_dlp
 # Configuration
 # ---------------------------------------------------------------------------
 
-MISTRAL_MODEL = "voxtral-mini-latest"
+# Voxtral Small Transcribe 3 (meilleur modèle de transcription de la famille
+# Voxtral 3, sorti le 2026-10-20). Pas d'alias -latest pour Voxtral 3 :
+# l'ID épinglé est voxtral-small-transcribe-3-0 (alias: voxtral-small-transcribe-3).
+# Override possible via VOXCAST_TRANSCRIBE_MODEL (ex: voxtral-mini-transcribe-3-0).
+MISTRAL_MODEL = os.environ.get("VOXCAST_TRANSCRIBE_MODEL",
+                               "voxtral-small-transcribe-3-0")
+
+# Presets de modèles de transcription Mistral (endpoint officiel).
+# Pour un modèle d'un autre fournisseur : voir base_url / model_api_key
+# (endpoint compatible OpenAI /v1/audio/transcriptions).
+MISTRAL_TRANSCRIBE_MODELS = [
+    ("voxtral-small-transcribe-3-0", "Voxtral Small Transcribe 3 (recommandé)"),
+    ("voxtral-small-transcribe-3", "Voxtral Small Transcribe 3 (alias)"),
+    ("voxtral-mini-transcribe-3-0", "Voxtral Mini Transcribe 3"),
+    ("voxtral-mini-transcribe-3", "Voxtral Mini Transcribe 3 (alias)"),
+    ("voxtral-mini-latest", "Voxtral Mini (legacy)"),
+]
+# Modèle chat utilisé pour les résumés in-app (Mistral Large)
+SUMMARY_MODEL = "mistral-large-latest"
+# Taille max d'un extrait envoyé au modèle pour le résumé (map-reduce)
+SUMMARY_CHUNK_CHARS = 30000
 MAX_AUDIO_HOURS = 3
 MAX_AUDIO_SECONDS = MAX_AUDIO_HOURS * 3600
 MAX_FILE_SIZE_MB = 500
 CHUNK_HOURS = 2.75
 CHUNK_SECONDS = int(CHUNK_HOURS * 3600)
 AUDIO_BITRATE = "128K"
-COST_PER_MIN = 0.003
+COST_PER_MIN = 0.004  # Voxtral Small Transcribe 3 : $0.004/min (batch)
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # secondes
 
@@ -562,6 +582,14 @@ def split_audio(mp3_path: Path, output_dir: Path,
 # Transcription Mistral Voxtral
 # ---------------------------------------------------------------------------
 
+def normalize_base_url(base_url: str) -> str:
+    """Normalise une URL de base d'API : le SDK ajoute /v1/... tout seul."""
+    base = base_url.strip().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return base
+
+
 def transcribe_audio(
     mp3_path: Path,
     api_key: str,
@@ -569,22 +597,42 @@ def transcribe_audio(
     diarize: bool = False,
     timestamp_granularities: Optional[list[str]] = None,
     context_bias: Optional[list[str]] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model_api_key: Optional[str] = None,
 ) -> dict:
+    """
+    Transcription via l'endpoint /v1/audio/transcriptions.
+    - Sans base_url : API Mistral officielle (Mistral), modèle Voxtral.
+    - Avec base_url : n'importe quel endpoint compatible OpenAI
+      (ex. https://api.groq.com) avec sa propre clé (model_api_key).
+    diarize/context_bias sont spécifiques à Voxtral : ils ne sont envoyés
+    que vers l'API Mistral.
+    """
     from mistralai.client import Mistral
-    client = Mistral(api_key=api_key)
-    print(f"Transcription en cours via Mistral Voxtral...")
+    model = model or MISTRAL_MODEL
+    if base_url:
+        client = Mistral(api_key=model_api_key or api_key,
+                         server_url=normalize_base_url(base_url))
+    else:
+        client = Mistral(api_key=api_key)
+    print(f"Transcription en cours via {model}...")
     kwargs = {
-        "model": MISTRAL_MODEL,
+        "model": model,
         "file": {"content": open(mp3_path, "rb"), "file_name": mp3_path.name},
     }
     if language:
         kwargs["language"] = language
-    if diarize:
-        kwargs["diarize"] = True
     if timestamp_granularities:
         kwargs["timestamp_granularities"] = timestamp_granularities
-    if context_bias:
-        kwargs["context_bias"] = context_bias
+    if not base_url:
+        # Paramètres spécifiques à Voxtral (API Mistral uniquement)
+        if diarize:
+            kwargs["diarize"] = True
+        if context_bias:
+            kwargs["context_bias"] = context_bias
+    elif diarize or context_bias:
+        print("Note: diarisation/context bias ignorés (non supportés par cet endpoint).")
 
     response = client.audio.transcriptions.complete(**kwargs)
     return response.model_dump() if hasattr(response, "model_dump") else dict(response)
@@ -598,6 +646,9 @@ def transcribe_with_retry(
     timestamp_granularities: Optional[list[str]] = None,
     context_bias: Optional[list[str]] = None,
     max_retries: int = MAX_RETRIES,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model_api_key: Optional[str] = None,
 ) -> dict:
     """Transcription avec retry automatique en cas d'échec."""
     last_error = None
@@ -610,6 +661,9 @@ def transcribe_with_retry(
                 diarize=diarize,
                 timestamp_granularities=timestamp_granularities,
                 context_bias=context_bias,
+                model=model,
+                base_url=base_url,
+                model_api_key=model_api_key,
             )
         except Exception as e:
             last_error = e
@@ -946,6 +1000,9 @@ def run_pipeline(
     progress_callback=None,
     log_callback=None,
     cancel_check=None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model_api_key: Optional[str] = None,
 ) -> Path:
     """
     Pipeline complet : download/local → split → transcribe → save.
@@ -1089,6 +1146,9 @@ def run_pipeline(
                 diarize=diarize,
                 timestamp_granularities=timestamp_granularities,
                 context_bias=context_bias,
+                model=model,
+                base_url=base_url,
+                model_api_key=model_api_key,
             )
             elapsed = time.monotonic() - t0
             if chunk_dur > 0:
@@ -1208,6 +1268,9 @@ def main():
     parser.add_argument("--srt", action="store_true", help="Exporte aussi en SRT")
     parser.add_argument("--vtt", action="store_true", help="Exporte aussi en VTT")
     parser.add_argument("--file", action="store_true", help="Source = fichier audio local (auto-détecté sinon)")
+    parser.add_argument("--model", help="ID du modèle de transcription (défaut: %s)" % MISTRAL_MODEL)
+    parser.add_argument("--base-url", help="URL de base d'une API perso compatible /v1/audio/transcriptions (ex: https://api.groq.com)")
+    parser.add_argument("--model-api-key", help="Clé API du fournisseur custom (défaut: la clé Mistral)")
 
     args = parser.parse_args()
 
@@ -1240,6 +1303,9 @@ def main():
         is_local_file=is_local,
         export_srt_file=args.srt,
         export_vtt_file=args.vtt,
+        model=args.model,
+        base_url=args.base_url,
+        model_api_key=args.model_api_key,
     )
 
 
