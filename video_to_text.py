@@ -927,10 +927,19 @@ def chat_with_tools(
             except Exception:
                 pass
 
+    # Historique propre : uniquement les tours user/assistant simples.
+    # On ne persiste PAS la liste `messages` interne (qui contient le system,
+    # les tool_calls et les réponses d'outils) : renvoyée telle quelle à
+    # l'API à la question suivante, elle provoque un rejet 400.
+    history = [m for m in (history or [])
+               if isinstance(m, dict)
+               and m.get("role") in ("user", "assistant")
+               and "tool_calls" not in m and "tool_call_id" not in m]
+    saved = list(history) + [{"role": "user", "content": question}]
+
     messages = [
         {"role": "system", "content": CHAT_SYSTEM_PROMPT + "\n\nDOCUMENT:\n" + context_text},
-        *history,
-        {"role": "user", "content": question},
+        *saved,
     ]
 
     for round_nb in range(1, max_tool_rounds + 1):
@@ -945,7 +954,8 @@ def chat_with_tools(
         if not tool_calls:
             answer = msg.content or ""
             messages.append({"role": "assistant", "content": answer})
-            return answer, messages
+            saved.append({"role": "assistant", "content": answer})
+            return answer, saved
 
         # Le modèle demande des outils : on les exécute localement
         messages.append({
@@ -983,7 +993,8 @@ def chat_with_tools(
     resp = _complete(model=model, messages=messages, temperature=0.3)
     answer = resp.choices[0].message.content or ""
     messages.append({"role": "assistant", "content": answer})
-    return answer, messages
+    saved.append({"role": "assistant", "content": answer})
+    return answer, saved
 
 
 # ---------------------------------------------------------------------------

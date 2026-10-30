@@ -2904,9 +2904,15 @@ class VoxCastWindow:
     def _load_chat_history(self, transcript: dict) -> list[dict]:
         try:
             data = json.loads(self._chat_path(transcript).read_text(encoding="utf-8"))
-            return data if isinstance(data, list) else []
         except Exception:
             return []
+        if not isinstance(data, list):
+            return []
+        # ne garder que les tours user/assistant affichables (exclut system/tool)
+        return [m for m in data
+                if isinstance(m, dict)
+                and m.get("role") in ("user", "assistant")
+                and "tool_calls" not in m and m.get("content")]
 
     def _save_chat_history(self, transcript: dict, history: list[dict]):
         try:
