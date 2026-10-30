@@ -22,10 +22,51 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
+gi.require_version("Gst", "1.0")
 
-from gi.repository import Gtk, Gdk, Gio, GLib, Adw, Pango
+from gi.repository import Gtk, Gdk, Gio, GLib, Adw, Pango, Gst
 
 import video_to_text as vtt
+
+_GST_INIT = [False]
+
+
+class GstPlayer:
+    """Lecteur audio via playbin (GStreamer legacy).
+
+    Gtk.MediaFile passait par decodebin3, qui plante sur certaines
+    configurations (assertion mq_slot_handle_stream_start) ; playbin
+    évite ce chemin. L'interface imite Gtk.MediaFile (timestamps en µs).
+    """
+
+    def __init__(self, path: Path):
+        if not _GST_INIT[0]:
+            Gst.init(None)
+            _GST_INIT[0] = True
+        self._pipe = Gst.ElementFactory.make("playbin", None)
+        if self._pipe is None:
+            raise RuntimeError("playbin indisponible (GStreamer)")
+        self._pipe.set_property("uri", path.absolute().as_uri())
+
+    def play(self):
+        self._pipe.set_state(Gst.State.PLAYING)
+
+    def set_paused(self, paused: bool):
+        self._pipe.set_state(Gst.State.PAUSED if paused else Gst.State.PLAYING)
+
+    def get_paused(self) -> bool:
+        return self._pipe.get_state(0)[1] == Gst.State.PAUSED
+
+    def get_timestamp(self) -> int:  # µs
+        ok, pos = self._pipe.query_position(Gst.Format.TIME)
+        return pos // 1000 if ok and pos >= 0 else 0
+
+    def get_duration(self) -> int:  # µs
+        ok, dur = self._pipe.query_duration(Gst.Format.TIME)
+        return dur // 1000 if ok and dur >= 0 else 0
+
+    def stop(self):
+        self._pipe.set_state(Gst.State.NULL)
 
 
 # ============================================================================
@@ -2677,6 +2718,10 @@ class VoxCastWindow:
                 t["player"].set_paused(True)
             except Exception:
                 pass
+            try:
+                t["player"].stop()  # libère le pipeline GStreamer
+            except Exception:
+                pass
             t["player"] = None
         if t["current"] >= 0 and t["current"] < len(t["blocks"]):
             try:
@@ -2736,12 +2781,12 @@ class VoxCastWindow:
     def _tts_play(self, dialog):
         t = dialog._tts
         mp3 = self._tts_path(t["transcript"])
-        player = Gtk.MediaFile.new_for_filename(str(mp3))
+        player = GstPlayer(mp3)
         player.play()
         t["player"] = player
         t["btn"].set_icon_name("media-playback-pause-symbolic")
         t["poll_id"] = GLib.timeout_add(200, self._tts_poll, dialog)
-        # arrêt automatique en fin de lecture
+        # arrêt automatique en fin de lecture (si la durée est connue)
         dur = player.get_duration()  # µs
         if dur > 0:
             GLib.timeout_add(int(dur / 1000) + 800,
