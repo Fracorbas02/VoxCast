@@ -538,6 +538,9 @@ class VoxCastWindow:
         self.stack.add_titled_with_icon(
             self._build_library_page(), "library", _("Bibliothèque"),
             "folder-documents-symbolic")
+        self.stack.add_titled_with_icon(
+            self._build_stats_page(), "stats", _("Stats"),
+            "applications-system-symbolic")
 
         toolbar_view = Adw.ToolbarView()
         toolbar_view.add_top_bar(self.api_banner)
@@ -1868,6 +1871,176 @@ class VoxCastWindow:
     def refresh_transcripts_list(self, button=None):
         self.all_transcripts = self._get_transcripts()
         self._filter_transcripts(self.search_entry.get_text())
+        self._refresh_stats()
+
+    # ------------------------------------------------------------------
+    # Page « Stats » (tableau de bord)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_md_meta(path: Path) -> dict:
+        """Extrait durée / modèle / tokens / coût depuis l'en-tête du .md."""
+        meta = {"duration_s": None, "model": "", "tokens": None, "cost": None,
+                "lang": ""}
+        try:
+            head = []
+            with path.open(encoding="utf-8") as f:
+                for i, line in enumerate(f):
+                    if i >= 80:  # l'en-tête + la section Métriques
+                        break
+                    head.append(line)
+        except Exception:
+            return meta
+        text = "\n".join(head)
+        m = re.search(r"\*\*Dur\u00e9e?\*\*\s*:\s*(\d+):(\d{2}):(\d{2})", text)
+        if m:
+            meta["duration_s"] = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+        m = re.search(r"\*\*Mod\u00e8le\*\*\s*:\s*`?([^`\n]+)`?", text)
+        if m:
+            meta["model"] = m.group(1).strip()
+        m = re.search(r"Tokens?\s*(?:total)?\s*:\s*([\d\s.,]+)", text, re.IGNORECASE)
+        if m:
+            try:
+                meta["tokens"] = int(m.group(1).replace(" ", "").replace(".", "").replace(",", ""))
+            except ValueError:
+                pass
+        m = re.search(r"Co\u00fbt\s*(?:estim\u00e9)?\s*:\s*\$?([\d.,]+)", text, re.IGNORECASE)
+        if m:
+            try:
+                meta["cost"] = float(m.group(1).replace(",", "."))
+            except ValueError:
+                pass
+        m = re.search(r"\*\*Langue\*\*\s*:\s*([^\n]+)", text)
+        if m:
+            meta["lang"] = m.group(1).strip()
+        # coût : lu dans le .md s'il y est, sinon estimé depuis la durée
+        if meta["cost"] is None and meta["duration_s"]:
+            try:
+                meta["cost"] = meta["duration_s"] / 60 * vtt.COST_PER_MIN
+            except Exception:
+                pass
+        return meta
+
+    def _build_stats_page(self) -> Gtk.Widget:
+        self.stats_container = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=18,
+            margin_top=24, margin_bottom=32,
+            margin_start=24, margin_end=24)
+        scrolled = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            vexpand=True,
+            child=Adw.Clamp(maximum_size=860, child=self.stats_container))
+        self._refresh_stats()
+        return scrolled
+
+    def _refresh_stats(self):
+        """Reconstruit le tableau de bord depuis les métadonnées des .md."""
+        if not hasattr(self, "stats_container"):
+            return
+        container = self.stats_container
+        child = container.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            container.remove(child)
+            child = nxt
+
+        items = []
+        total_dur = 0
+        total_cost = 0.0
+        total_tokens = 0
+        per_model: dict[str, dict] = {}
+        per_month: dict[str, dict] = {}
+        for t in getattr(self, "all_transcripts", []):
+            meta = self._parse_md_meta(t["path"])
+            items.append((t, meta))
+            if meta["duration_s"]:
+                total_dur += meta["duration_s"]
+            if meta["cost"] is not None:
+                total_cost += meta["cost"]
+            if meta["tokens"]:
+                total_tokens += meta["tokens"]
+            model = meta["model"] or _("Inconnu")
+            pm = per_model.setdefault(model, {"count": 0, "duration_s": 0})
+            pm["count"] += 1
+            pm["duration_s"] += meta["duration_s"] or 0
+            try:
+                month = datetime.fromtimestamp(t["path"].stat().st_mtime).strftime("%Y-%m")
+            except Exception:
+                month = "?"
+            pe = per_month.setdefault(month, {"count": 0, "duration_s": 0})
+            pe["count"] += 1
+            pe["duration_s"] += meta["duration_s"] or 0
+
+        def hms(s: float) -> str:
+            s = int(s)
+            return f"{s // 3600}h{(s % 3600) // 60:02d}m{s % 60:02d}s"
+
+        # --- cartes de chiffres clés ---
+        cards = Gtk.Box(spacing=12, halign=Gtk.Align.FILL)
+        learned = vtt.get_learned_speed() if hasattr(vtt, "get_learned_speed") else None
+
+        def card(value: str, label: str) -> Gtk.Widget:
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                          css_classes=["stat-card"], halign=Gtk.Align.FILL,
+                          hexpand=True)
+            v = Gtk.Label(label=value, halign=Gtk.Align.START,
+                          css_classes=["stat-value"])
+            l = Gtk.Label(label=label, halign=Gtk.Align.START,
+                          css_classes=["caption", "dim-label"])
+            box.append(v)
+            box.append(l)
+            return box
+
+        cards.append(card(str(len(items)), _("Transcriptions")))
+        cards.append(card(hms(total_dur), _("Durée totale")))
+        cards.append(card(f"${total_cost:.4f}", _("Coût API estimé")))
+        cards.append(card(f"{total_tokens:,}".replace(",", " "), _("Tokens (résumés)")))
+        if learned:
+            cards.append(card(f"{learned:.1f} min/min",
+                              _("Vitesse apprise (transcription)")))
+        container.append(cards)
+
+        # --- activité par mois (barres) ---
+        if per_month:
+            months = sorted(per_month)
+            max_dur = max((per_month[m]["duration_s"] for m in months), default=0) or 1
+            group = Adw.PreferencesGroup(
+                title=_("Activité par mois"),
+                description=_("Durée totale de média transcrit chaque mois"))
+            for m in months:
+                e = per_month[m]
+                row = Adw.ActionRow(
+                    title=datetime.strptime(m, "%Y-%m").strftime("%B %Y")
+                    if m != "?" else m,
+                    subtitle=f"{e['count']} fichier(s) — {hms(e['duration_s'])}")
+                bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                              css_classes=["bar-track"], hexpand=True,
+                              valign=Gtk.Align.CENTER, height_request=10)
+                fill = Gtk.Box(css_classes=["bar-fill"], hexpand=False)
+                fill.set_size_request(int(160 * e["duration_s"] / max_dur), 10)
+                bar.append(fill)
+                row.add_suffix(bar)
+                group.add(row)
+            container.append(group)
+
+        # --- par modèle ---
+        if per_model:
+            group = Adw.PreferencesGroup(title=_("Par modèle de transcription"))
+            for model, e in sorted(per_model.items(),
+                                   key=lambda kv: -kv[1]["duration_s"]):
+                row = Adw.ActionRow(
+                    title=model,
+                    subtitle=f"{e['count']} fichier(s) — {hms(e['duration_s'])}")
+                group.add(row)
+            container.append(group)
+
+        if not items:
+            container.append(Adw.StatusPage(
+                icon_name="applications-system-symbolic",
+                title=_("Aucune statistique pour le moment"),
+                description=_("Transcrivez des médias pour voir apparaître "
+                              "durées, coûts et tokens ici.")))
 
     def on_search_changed(self, entry):
         self._filter_transcripts(entry.get_text())
