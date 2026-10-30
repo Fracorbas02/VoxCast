@@ -16,9 +16,11 @@ Usage:
 
 from concurrent.futures import ProcessPoolExecutor
 import argparse
+import base64
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -796,6 +798,236 @@ def summarize_text(api_key: str, text: str, progress_callback=None) -> str:
     ], temperature=0.2)
     _progress(1.0, "Résumé terminé")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Recherche web (outil "web_search" du chat) — sans clé API, via DuckDuckGo
+# ---------------------------------------------------------------------------
+
+def web_search(query: str, max_results: int = 5) -> list[dict]:
+    """Recherche web via l'endpoint HTML de DuckDuckGo.
+    Retourne [{title, url, snippet}, ...] (vide si réseau indisponible)."""
+    import re as _re
+    from html import unescape
+    import httpx
+    results = []
+    try:
+        r = httpx.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query},
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return results
+        titles = _re.findall(
+            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', r.text, _re.S)
+        snippets = _re.findall(
+            r'class="result__snippet"[^>]*>(.*?)</a>', r.text, _re.S)
+        for i, (href, title) in enumerate(titles[:max_results]):
+            m = _re.search(r"uddg=([^&]+)", href)  # DDG wrappe les URLs
+            url = unescape(m.group(1)) if m else href
+            snip = ""
+            if i < len(snippets):
+                snip = unescape(_re.sub(r"<[^>]+>", "", snippets[i])).strip()
+            results.append({
+                "title": unescape(_re.sub(r"<[^>]+>", "", title)).strip(),
+                "url": url,
+                "snippet": snip,
+            })
+    except Exception as e:
+        print(f"web_search indisponible: {e}")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Chat avec outils (function calling : le modèle peut chercher sur le web)
+# ---------------------------------------------------------------------------
+
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Recherche sur internet. À utiliser dès que la question porte sur "
+            "l'actualité, des faits extérieurs au document, ou des sources "
+            "à citer."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string",
+                                    "description": "Requête de recherche"}},
+            "required": ["query"],
+        },
+    },
+}
+
+CHAT_SYSTEM_PROMPT = (
+    "Tu es un assistant qui répond aux questions sur un document (transcription "
+    "d'une vidéo ou d'un fichier audio) fourni ci-dessous. Réponds en français, "
+    "de façon précise et concise, en t'appuyant sur le document. Si la question "
+    "porte sur l'actualité ou des informations extérieures au document, utilise "
+    "l'outil web_search et cite tes sources (URL entre parenthèses)."
+)
+
+
+def chat_with_tools(
+    api_key: str,
+    context_text: str,
+    history: list[dict],
+    question: str,
+    model: str = SUMMARY_MODEL,
+    progress_callback=None,
+    max_tool_rounds: int = 4,
+) -> tuple[str, list[dict]]:
+    """
+    Chat avec function calling : le modèle peut appeler l'outil web_search
+    (exécuté localement via DuckDuckGo). Retourne (réponse, history maj).
+    """
+    from mistralai.client import Mistral
+    client = Mistral(api_key=api_key)
+
+    # Compresse le contexte si énorme (map-reduce réutilisé)
+    if len(context_text) > 90000:
+        if progress_callback:
+            progress_callback("Compression du contexte...")
+        context_text = summarize_text(api_key, context_text, progress_callback)
+
+    def _progress(msg):
+        if progress_callback:
+            try:
+                progress_callback(msg)
+            except Exception:
+                pass
+
+    messages = [
+        {"role": "system", "content": CHAT_SYSTEM_PROMPT + "\n\nDOCUMENT:\n" + context_text},
+        *history,
+        {"role": "user", "content": question},
+    ]
+
+    for round_nb in range(1, max_tool_rounds + 1):
+        _progress(f"Réflexion... (tour {round_nb})")
+        resp = client.chat.complete(
+            model=model, messages=messages,
+            tools=[WEB_SEARCH_TOOL], tool_choice="auto", temperature=0.3,
+        )
+        msg = resp.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None)
+        if not tool_calls:
+            answer = msg.content or ""
+            messages.append({"role": "assistant", "content": answer})
+            return answer, messages
+
+        # Le modèle demande des outils : on les exécute localement
+        messages.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name,
+                              "arguments": tc.function.arguments
+                              if isinstance(tc.function.arguments, str)
+                              else json.dumps(tc.function.arguments)}}
+                for tc in tool_calls
+            ],
+        })
+        for tc in tool_calls:
+            args = tc.function.arguments
+            if not isinstance(args, dict):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            if tc.function.name == "web_search":
+                q = args.get("query", question)
+                _progress(f"Recherche web : {q}")
+                results = web_search(q)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": "web_search",
+                    "content": json.dumps(results, ensure_ascii=False),
+                })
+
+    # Dernier tour sans outil
+    resp = client.chat.complete(model=model, messages=messages, temperature=0.3)
+    answer = resp.choices[0].message.content or ""
+    messages.append({"role": "assistant", "content": answer})
+    return answer, messages
+
+
+# ---------------------------------------------------------------------------
+# TTS (Voxtral Mini TTS 3) — synthèse vocale des résumés
+# ---------------------------------------------------------------------------
+
+TTS_MODEL = "voxtral-mini-tts-3-0"
+TTS_CHUNK_CHARS = 8000
+TTS_API_BASE = "https://api.mistral.ai/v1"
+
+
+def list_voices(api_key: str) -> list[dict]:
+    """Liste les voix preset disponibles (name, slug, languages)."""
+    import httpx
+    r = httpx.get(f"{TTS_API_BASE}/audio/voices",
+                  headers={"Authorization": f"Bearer {api_key}"}, timeout=20)
+    r.raise_for_status()
+    return [{"name": v.get("name"), "slug": v.get("slug"),
+             "languages": v.get("languages", [])}
+            for v in r.json().get("items", [])]
+
+
+def tts_generate(
+    api_key: str,
+    text: str,
+    out_path: Path,
+    voice_id: Optional[str] = None,
+    model: str = TTS_MODEL,
+    progress_callback=None,
+) -> Path:
+    """Génère un MP3 via Voxtral TTS 3 (découpage + concat ffmpeg)."""
+    import httpx
+    chunks = _split_for_summary(text, TTS_CHUNK_CHARS)
+    if not chunks or not chunks[0].strip():
+        raise ValueError("Texte vide")
+    if voice_id is None:
+        voices = list_voices(api_key)
+        voice_id = voices[0]["slug"] if voices else None
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmpdir = out_path.parent / f".tts_{out_path.stem}"
+    tmpdir.mkdir(exist_ok=True)
+    parts = []
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        for i, chunk in enumerate(chunks):
+            if progress_callback:
+                progress_callback(i / len(chunks),
+                                  f"Synthèse vocale {i + 1}/{len(chunks)}...")
+            payload = {"model": model, "input": chunk, "response_format": "mp3"}
+            if voice_id:
+                payload["voice_id"] = voice_id
+            r = httpx.post(f"{TTS_API_BASE}/audio/speech", headers=headers,
+                           json=payload, timeout=180)
+            r.raise_for_status()
+            part = tmpdir / f"part_{i:03d}.mp3"
+            part.write_bytes(base64.b64decode(r.json()["audio_data"]))
+            parts.append(part)
+        if len(parts) == 1:
+            shutil.move(str(parts[0]), str(out_path))
+        else:
+            concat = tmpdir / "concat.txt"
+            concat.write_text("".join(f"file '{p}'\n" for p in parts))
+            subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                 "-i", str(concat), "-c", "copy", str(out_path)],
+                check=True, capture_output=True)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    if progress_callback:
+        progress_callback(1.0, "Audio généré")
+    print(f"TTS sauvegardé : {out_path}")
+    return out_path
 
 
 # ---------------------------------------------------------------------------
