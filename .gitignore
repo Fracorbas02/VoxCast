@@ -8,3 +8,4 @@ voxccast.log
 settings.json
 .cache.json
 .stats.json
+queue.json

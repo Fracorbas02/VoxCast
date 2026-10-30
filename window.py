@@ -33,6 +33,7 @@ import video_to_text as vtt
 APP_ID = "com.voxcast.app"
 APP_DIR = Path(__file__).parent
 DEFAULT_TRANSCRIPTS_DIR = APP_DIR / "transcripts"
+QUEUE_FILE = APP_DIR / "queue.json"  # file d'attente persistée (reprise après crash)
 LOG_FILE = APP_DIR / "voxccast.log"
 VERSION = "1.1.0"
 
@@ -549,6 +550,7 @@ class VoxCastWindow:
 
         self.setup_accelerators()
         self.refresh_transcripts_list()
+        self._load_queue()  # reprise de la file persistée (crash / redémarrage)
 
         self.window.present()
 
@@ -1471,6 +1473,53 @@ class VoxCastWindow:
         # Mettre à jour l'état du bouton start
         pending = [q for q in self.queue if q.status == STATUS_PENDING]
         self.start_btn.set_sensitive(len(pending) > 0 and not self.running)
+        self._save_queue()
+
+    # ------------------------------------------------------------------
+    # Persistance de la file d'attente (reprise après crash / redémarrage)
+    # ------------------------------------------------------------------
+
+    def _save_queue(self):
+        """Écrit les items non terminés dans queue.json (à la racine du projet)."""
+        try:
+            data = [
+                {
+                    "source": q.source,
+                    "is_local": q.is_local,
+                    "options": q.options,
+                    "duration": q.duration,
+                }
+                for q in self.queue
+                if q.status in (STATUS_PENDING, STATUS_RUNNING, STATUS_ERROR)
+            ]
+            QUEUE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                                  encoding="utf-8")
+        except Exception as e:
+            self.log_message(f"queue save: {e}")
+
+    def _load_queue(self):
+        """Recharge la file persistée ; les items repartent en « pending »."""
+        try:
+            data = json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(data, list):
+            return
+        for entry in data:
+            try:
+                item = QueueItem(
+                    entry.get("source", ""),
+                    bool(entry.get("is_local", False)),
+                    entry.get("options") or {},
+                )
+                item.duration = entry.get("duration")
+                if item.source:
+                    self.queue.append(item)
+            except Exception as e:
+                self.log_message(f"queue load: {e}")
+        if self.queue:
+            self.log_message(f"File d'attente restaurée : {len(self.queue)} élément(s)")
+        self._refresh_queue_list()
 
     def _create_queue_row(self, item: QueueItem, index: int) -> Gtk.Widget:
         box = Gtk.Box(spacing=12, halign=Gtk.Align.FILL,
@@ -1769,6 +1818,7 @@ class VoxCastWindow:
             item.status_label.add_css_class(f"pill-{item.status}")
         if item.progress_bar:
             item.progress_bar.set_visible(item.status == STATUS_RUNNING)
+        self._save_queue()
 
     def _on_item_progress(self, item: QueueItem, frac: float, message: str):
         """Colle la barre de l'item sur l'activité réelle du pipeline,
@@ -1792,6 +1842,7 @@ class VoxCastWindow:
         self.eta_label.set_label("")
         self._refresh_queue_list()
         self.refresh_transcripts_list()
+        self._save_queue()  # file terminée -> queue.json vidée
 
     def _send_notification(self, title: str, body: str):
         """Notification système (Gio.Notification) — appelé via GLib.idle_add."""
@@ -2781,6 +2832,7 @@ class VoxCastWindow:
 
     def on_shutdown(self, app):
         self.cancelled = True
+        self._save_queue()  # conserve les éléments en attente
         if self.queue_thread:
             self.queue_thread.join(timeout=3)
 
