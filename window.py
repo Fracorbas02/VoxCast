@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -2192,6 +2193,15 @@ class VoxCastWindow:
         act = Gio.SimpleAction(name="summary")
         act.connect("activate", lambda *_a, tr=t: self.on_summarize_clicked(tr))
         actions.add_action(act)
+        act = Gio.SimpleAction(name="chat")
+        act.connect("activate", lambda *_a, tr=t: self.on_chat_clicked(tr))
+        actions.add_action(act)
+        act = Gio.SimpleAction(name="html")
+        act.connect("activate", lambda *_a, tr=t: self.on_export_html(tr))
+        actions.add_action(act)
+        act = Gio.SimpleAction(name="pdf")
+        act.connect("activate", lambda *_a, tr=t: self.on_export_pdf(tr))
+        actions.add_action(act)
         act = Gio.SimpleAction(name="open")
         act.connect("activate", lambda *_a, tr=t: self.on_open_transcript_clicked(tr))
         actions.add_action(act)
@@ -2952,6 +2962,171 @@ class VoxCastWindow:
         if not transcript:
             return
         self._export_subtitle(transcript, "vtt")
+
+    # ------------------------------------------------------------------
+    # Export enrichi HTML / PDF
+    # ------------------------------------------------------------------
+
+    def _md_to_html(self, title: str, md_text: str) -> str:
+        """Convertit le Markdown de transcription en HTML autonome (CSS inclus).
+
+        - titres avec ancres (#chapitre-N) + sommaire des chapitres
+        - timestamps [HH:MM:SS] cliquables en <span class="ts">
+        """
+        def esc(s: str) -> str:
+            return html.escape(s, quote=False)
+
+        def inline(s: str) -> str:
+            s = esc(s)
+            s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+            s = re.sub(r"\*(.+?)\*", r"<em>\1</em>", s)
+            s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+            s = re.sub(r"\[(\d{2}:\d{2}:\d{2})(?:\s*-\s*(\d{2}:\d{2}:\d{2}))?\]",
+                       lambda m: f'<span class="ts">[{m.group(1)}'
+                                 + (f' - {m.group(2)}' if m.group(2) else '')
+                                 + "]</span>", s)
+            return s
+
+        toc: list[str] = []
+        body: list[str] = []
+        in_code = False
+        code_lines: list[str] = []
+        in_list = False
+
+        def close_list():
+            nonlocal in_list
+            if in_list:
+                body.append("</ul>")
+                in_list = False
+
+        for line in md_text.split("\n"):
+            if line.strip().startswith("```"):
+                if in_code:
+                    body.append("<pre><code>" + esc("\n".join(code_lines))
+                                + "</code></pre>")
+                    code_lines = []
+                    in_code = False
+                else:
+                    close_list()
+                    in_code = True
+                continue
+            if in_code:
+                code_lines.append(line)
+                continue
+            stripped = line.strip()
+            if not stripped:
+                close_list()
+                continue
+            m = re.match(r"^(#{1,3})\s+(.*)$", stripped)
+            if m:
+                close_list()
+                level = len(m.group(1))
+                text = m.group(2).strip()
+                anchor = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+                if level <= 2 and anchor:
+                    toc.append((anchor, text, level))
+                body.append(
+                    f'<h{level} id="{anchor}">{inline(text)}</h{level}>')
+                continue
+            if set(stripped) == {"-"} and len(stripped) >= 3:
+                close_list()
+                body.append("<hr>")
+                continue
+            m = re.match(r"^[-*+]\s+(.*)$", stripped)
+            if m:
+                if not in_list:
+                    body.append("<ul>")
+                    in_list = True
+                body.append(f"<li>{inline(m.group(1))}</li>")
+                continue
+            close_list()
+            if stripped.startswith("> "):
+                body.append(f"<blockquote>{inline(stripped[2:])}</blockquote>")
+            else:
+                body.append(f"<p>{inline(stripped)}</p>")
+        close_list()
+        if in_code and code_lines:
+            body.append("<pre><code>" + esc("\n".join(code_lines))
+                        + "</code></pre>")
+
+        toc_html = ""
+        if toc:
+            items = "".join(
+                f'<li class="lvl{lvl}"><a href="#{a}">{esc(t)}</a></li>'
+                for a, t, lvl in toc)
+            toc_html = f"<nav class=\"toc\"><h2>Sommaire</h2><ul>{items}</ul></nav>"
+
+        return f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(title)}</title>
+<style>
+:root {{ color-scheme: light dark; }}
+body {{ font-family: system-ui, sans-serif; max-width: 780px; margin: 2rem auto;
+       padding: 0 1.2rem; line-height: 1.6; }}
+h1,h2,h3 {{ line-height: 1.25; }}
+.toc {{ background: rgba(127,127,127,.12); border-radius: 10px;
+        padding: .8rem 1.2rem; margin-bottom: 1.6rem; }}
+.toc ul {{ margin: .3rem 0; padding-left: 1.2rem; }}
+.toc .lvl2 {{ margin-left: 1rem; }}
+.ts {{ color: #3584e4; font-variant-numeric: tabular-nums; cursor: default;
+       white-space: nowrap; }}
+code {{ background: rgba(127,127,127,.18); border-radius: 4px; padding: 0 .25em; }}
+pre {{ background: rgba(127,127,127,.15); padding: .8rem; border-radius: 8px;
+        overflow-x: auto; }}
+blockquote {{ border-left: 3px solid #3584e4; margin-left: 0;
+               padding-left: 1rem; opacity: .85; }}
+hr {{ border: none; border-top: 1px solid rgba(127,127,127,.35); }}
+a {{ color: #3584e4; }}
+</style>
+</head>
+<body>
+<h1>{esc(title)}</h1>
+{toc_html}
+{chr(10).join(body)}
+</body>
+</html>
+"""
+
+    def on_export_html(self, transcript: dict):
+        if not transcript:
+            return
+        try:
+            md_text = transcript["path"].read_text(encoding="utf-8")
+            out = transcript["path"].with_suffix(".html")
+            out.write_text(self._md_to_html(transcript["name"], md_text),
+                           encoding="utf-8")
+            self.toast(f"HTML exporté : {out.name}", "success")
+        except Exception as e:
+            self.toast(f"Export HTML impossible : {e}", "error")
+
+    def on_export_pdf(self, transcript: dict):
+        if not transcript:
+            return
+        if not shutil.which("pandoc"):
+            self.toast(
+                "pandoc n'est pas installé — export PDF indisponible "
+                "(export HTML possible)", "error", 6)
+            return
+        try:
+            md_text = transcript["path"].read_text(encoding="utf-8")
+            tmp_md = transcript["path"].with_suffix(".pdfsrc.md")
+            tmp_md.write_text(md_text, encoding="utf-8")
+            out = transcript["path"].with_suffix(".pdf")
+            r = subprocess.run(
+                ["pandoc", str(tmp_md), "-o", str(out),
+                 "--metadata", f"title={transcript['name']}",
+                 "--pdf-engine=xelatex"],
+                capture_output=True, text=True, timeout=120)
+            tmp_md.unlink(missing_ok=True)
+            if r.returncode == 0 and out.exists():
+                self.toast(f"PDF exporté : {out.name}", "success")
+            else:
+                self.toast(f"pandoc a échoué : {r.stderr[:200]}", "error", 6)
+        except Exception as e:
+            self.toast(f"Export PDF impossible : {e}", "error")
 
     def _export_subtitle(self, transcript: dict, fmt: str):
         """Parse un .md de transcription et exporte en SRT ou VTT."""
