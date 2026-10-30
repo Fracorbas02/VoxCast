@@ -2000,12 +2000,15 @@ class VoxCastWindow:
             tooltip_text=_("Actions"),
         )
         menu = Gio.Menu()
-        menu.append("Aperçu dans l'app", "tr.preview")
-        menu.append("Résumé IA", "tr.summary")
-        menu.append("Ouvrir (externe)", "tr.open")
-        menu.append("Exporter en SRT", "tr.srt")
-        menu.append("Exporter en VTT", "tr.vtt")
-        menu.append("Supprimer", "tr.delete")
+        menu.append(_("Aperçu dans l'app"), "tr.preview")
+        menu.append(_("Résumé IA"), "tr.summary")
+        menu.append(_("Discuter avec l'IA"), "tr.chat")
+        menu.append(_("Ouvrir (externe)"), "tr.open")
+        menu.append(_("Exporter en SRT"), "tr.srt")
+        menu.append(_("Exporter en VTT"), "tr.vtt")
+        menu.append(_("Exporter en HTML"), "tr.html")
+        menu.append(_("Exporter en PDF"), "tr.pdf")
+        menu.append(_("Supprimer"), "tr.delete")
         menu_btn.set_menu_model(menu)
 
         actions = Gio.SimpleActionGroup()
@@ -2093,6 +2096,10 @@ class VoxCastWindow:
         summary_btn.connect("clicked",
                             lambda *_a: self.on_summarize_clicked(transcript))
         header.pack_end(summary_btn)
+        chat_btn = Gtk.Button(icon_name="user-available-symbolic",
+                              tooltip_text=_("Discuter avec l'IA"))
+        chat_btn.connect("clicked", lambda *_a: self.on_chat_clicked(transcript))
+        header.pack_end(chat_btn)
         toolbar.add_top_bar(header)
 
         inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -2443,7 +2450,165 @@ class VoxCastWindow:
             self.toast(f"Copie impossible : {e}", "error")
 
     # ========================================================================
-    # EXPORT SRT/VTT DEPUIS UNE TRANSCRIPTION EXISTANTE
+    # CHAT AVEC LA TRANSCRIPTION (Mistral Large + outil web_search)
+    # ========================================================================
+
+    def _chat_path(self, transcript: dict) -> Path:
+        return self.transcripts_dir / ".summaries" / f"{transcript['name']}.chat.json"
+
+    def on_chat_clicked(self, transcript: Optional[dict] = None):
+        """Ouvre la fenêtre de chat sur une transcription (clé API requise)."""
+        transcript = transcript or self._selected_transcript()
+        if not transcript:
+            return
+        self._ensure_api_key(lambda: self._show_chat_window(transcript))
+
+    def _load_chat_history(self, transcript: dict) -> list[dict]:
+        try:
+            data = json.loads(self._chat_path(transcript).read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_chat_history(self, transcript: dict, history: list[dict]):
+        try:
+            p = self._chat_path(transcript)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(history, ensure_ascii=False, indent=1),
+                         encoding="utf-8")
+        except Exception as e:
+            self.log_message(f"chat history: {e}")
+
+    def _add_chat_bubble(self, container: Gtk.Box, role: str, text: str):
+        outer = Gtk.Box(
+            halign=Gtk.Align.END if role == "user" else Gtk.Align.START,
+            margin_top=4, margin_bottom=4,
+            margin_start=60 if role == "user" else 0,
+            margin_end=0 if role == "user" else 60,
+        )
+        bubble = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=4,
+            css_classes=["chat-bubble-user" if role == "user"
+                         else "chat-bubble-assistant"],
+        )
+        bubble.append(self._build_md_view(text))
+        outer.append(bubble)
+        container.append(outer)
+
+    def _show_chat_window(self, transcript: dict):
+        dialog = Adw.Window(
+            transient_for=self.window,
+            modal=False,
+            title=f"{_('Discuter avec l\'IA')} — {transcript['name']}",
+            default_width=760,
+            default_height=640,
+        )
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Gtk.Label(label=_("Discuter avec l'IA"),
+                                          css_classes=["title-4"]))
+        toolbar.add_top_bar(header)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        self._chat_scroll = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            vexpand=True,
+        )
+        self._chat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self._chat_box.set_margin_top(16)
+        self._chat_box.set_margin_bottom(16)
+        self._chat_box.set_margin_start(16)
+        self._chat_box.set_margin_end(16)
+        self._chat_scroll.set_child(Adw.Clamp(maximum_size=700,
+                                              child=self._chat_box))
+        content.append(self._chat_scroll)
+
+        status = Gtk.Label(label="", halign=Gtk.Align.START,
+                           margin_start=14, css_classes=["caption", "dim-label"])
+        bottom = Gtk.Box(spacing=8)
+        bottom.set_margin_top(8)
+        bottom.set_margin_bottom(10)
+        bottom.set_margin_start(12)
+        bottom.set_margin_end(12)
+        entry = Gtk.Entry(
+            placeholder_text=_("Posez une question sur cette transcription..."),
+            hexpand=True,
+        )
+        send_btn = Gtk.Button(label=_("Envoyer"),
+                              css_classes=["suggested-action"])
+        bottom.append(entry)
+        bottom.append(send_btn)
+        content.append(status)
+        content.append(bottom)
+
+        toolbar.set_content(content)
+        dialog.set_content(toolbar)
+
+        state = {"history": self._load_chat_history(transcript), "busy": False}
+        dialog._chat_state = state
+        dialog._chat_transcript = transcript
+        dialog._chat_status = status
+        dialog._chat_entry = entry
+
+        for m in state["history"]:
+            self._add_chat_bubble(self._chat_box, m.get("role", "assistant"),
+                                  m.get("content", ""))
+
+        def scroll_bottom():
+            adj = self._chat_scroll.get_vadjustment()
+            adj.set_value(adj.get_upper() - adj.get_page_size())
+
+        def send(*_a):
+            q = entry.get_text().strip()
+            if not q or state["busy"]:
+                return
+            entry.set_text("")
+            state["busy"] = True
+            self._add_chat_bubble(self._chat_box, "user", q)
+            state["history"].append({"role": "user", "content": q})
+            status.set_label(_("Réflexion..."))
+            GLib.idle_add(scroll_bottom)
+
+            def work():
+                try:
+                    text = transcript["path"].read_text(encoding="utf-8")
+                    answer, new_hist = vtt.chat_with_tools(
+                        self.api_key, text, state["history"][:-1], q,
+                        progress_callback=lambda msg: GLib.idle_add(
+                            status.set_label, msg),
+                    )
+                    GLib.idle_add(self._on_chat_answer, dialog, answer,
+                                  new_hist)
+                except Exception as e:
+                    GLib.idle_add(self._on_chat_error, dialog, str(e))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        send_btn.connect("clicked", send)
+        entry.connect("activate", send)
+        dialog.present()
+        GLib.idle_add(scroll_bottom)
+
+    def _on_chat_answer(self, dialog, answer: str, history: list[dict]):
+        dialog._chat_state["busy"] = False
+        dialog._chat_state["history"] = history
+        self._add_chat_bubble(self._chat_box, "assistant", answer)
+        dialog._chat_status.set_label("")
+        self._save_chat_history(dialog._chat_transcript, history)
+        adj = self._chat_scroll.get_vadjustment()
+        adj.set_value(adj.get_upper() - adj.get_page_size())
+        return False
+
+    def _on_chat_error(self, dialog, message: str):
+        dialog._chat_state["busy"] = False
+        dialog._chat_status.set_label(f"{_('Erreur')} : {message}")
+        self.toast(f"Chat impossible : {message}", "error", 6)
+        return False
+
+    # ========================================================================
+    # EXPORT SRT/VTT/HTML/PDF DEPUIS UNE TRANSCRIPTION EXISTANTE
     # ========================================================================
 
     def on_export_srt(self, transcript: dict):
