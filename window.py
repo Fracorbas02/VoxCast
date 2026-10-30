@@ -80,13 +80,139 @@ STATUS_LABELS = {
     STATUS_CANCELLED: "Annulé",
 }
 
-STATUS_COLORS = {
-    STATUS_PENDING: "dim-label",
-    STATUS_RUNNING: "success",
-    STATUS_DONE: "success",
-    STATUS_ERROR: "error",
-    STATUS_CANCELLED: "dim-label",
+PILL_CLASSES = [f"pill-{s}" for s in STATUS_LABELS]
+
+# ============================================================================
+# FEUILLE DE STYLE CUSTOM (accent orange VoxCast / Mistral)
+# ============================================================================
+CUSTOM_CSS = """
+@define-color vox_accent #ff7a18;
+@define-color vox_accent_soft alpha(#ff7a18, 0.15);
+
+.hero-badge {
+    background-image: linear-gradient(135deg, #ffa94d 0%, #ff7a18 45%, #f03e3e 140%);
+    border-radius: 22px;
+    padding: 16px;
+    color: #ffffff;
 }
+
+.hero-title {
+    font-size: 30px;
+    font-weight: 800;
+}
+
+list.voxcast-list {
+    background: transparent;
+}
+
+list.voxcast-list row {
+    background-color: @card_bg_color;
+    border: 1px solid @borders;
+    border-radius: 14px;
+    margin: 4px 8px;
+    padding: 4px;
+}
+
+list.voxcast-list row:hover {
+    background-color: alpha(@vox_accent, 0.07);
+}
+
+list.voxcast-list row:selected {
+    background-color: alpha(@vox_accent, 0.12);
+    border-color: @vox_accent;
+}
+
+.icon-badge {
+    border-radius: 12px;
+    padding: 9px;
+}
+
+.badge-accent {
+    background-color: @vox_accent_soft;
+    color: @vox_accent;
+}
+
+.row-title {
+    font-weight: 700;
+}
+
+.status-pill {
+    border-radius: 999px;
+    padding: 3px 10px;
+    font-weight: 700;
+    font-size: 11px;
+}
+
+.pill-pending {
+    background-color: alpha(@theme_fg_color, 0.10);
+    color: alpha(@theme_fg_color, 0.75);
+}
+
+.pill-running {
+    background-color: @vox_accent;
+    color: #ffffff;
+}
+
+.pill-done {
+    background-color: @success_bg_color;
+    color: @success_fg_color;
+}
+
+.pill-error {
+    background-color: @error_bg_color;
+    color: @error_fg_color;
+}
+
+.pill-cancelled {
+    background-color: alpha(@theme_fg_color, 0.10);
+    color: alpha(@theme_fg_color, 0.55);
+}
+
+.pill-summary {
+    background-color: @vox_accent_soft;
+    color: @vox_accent;
+}
+
+progressbar.voxcast-progress trough {
+    background-color: alpha(@theme_fg_color, 0.12);
+    border-radius: 999px;
+    min-height: 8px;
+}
+
+progressbar.voxcast-progress trough progress {
+    background-image: linear-gradient(90deg, #ffa94d, #ff7a18 55%, #f03e3e);
+    border-radius: 999px;
+    min-height: 8px;
+}
+
+.status-bar {
+    background-color: @card_bg_color;
+    border: 1px solid @borders;
+    border-radius: 16px;
+    padding: 10px 16px;
+    margin: 6px 14px 14px;
+}
+
+window.drag-hover {
+    box-shadow: inset 0 0 0 3px @vox_accent;
+}
+
+button.suggested-action {
+    font-weight: 700;
+}
+
+.md-code {
+    font-family: monospace;
+    background-color: alpha(@theme_fg_color, 0.08);
+    border-radius: 10px;
+    padding: 10px;
+}
+
+.md-heading {
+    margin-top: 14px;
+    font-weight: 700;
+}
+"""
 
 
 # ============================================================================
@@ -128,57 +254,75 @@ class VoxCastWindow:
         self.queue: list[QueueItem] = []
         self.queue_thread: Optional[threading.Thread] = None
         self.all_transcripts: list[dict] = []
+        self.max_workers = 2
+        self.color_scheme = "default"  # default | light | dark
+        self.custom_models: list[dict] = []  # modèles perso {name, model, base_url, api_key}
+        self.model_profile: Optional[dict] = None  # profil sélectionné
+        self._notif_counter = 0
+        self._queue_total = 0
+        self._last_summary = ""
+        self._summaries_in_flight: set[str] = set()
 
         self.load_settings()
         self.window = None
 
     def on_activate(self, app):
+        self._load_css()
+        self._apply_color_scheme()
+
         self.window = Gtk.ApplicationWindow(
             application=app,
             title=f"VoxCast v{VERSION}",
-            default_width=1000,
+            default_width=1040,
             default_height=800,
         )
 
         # Support drag & drop de fichiers
         dnd = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
         dnd.connect("drop", self.on_drop_file)
+        dnd.connect("enter", self._on_drag_enter)
+        dnd.connect("leave", self._on_drag_leave)
         self.window.add_controller(dnd)
 
-        # ===== HEADER BAR =====
+        # ===== BARRE D'EN-TÊTE + SÉLECTEUR DE PAGE =====
         header = Adw.HeaderBar()
+
+        self.stack = Adw.ViewStack()
+        switcher = Adw.ViewSwitcher()
+        switcher.set_stack(self.stack)
+        switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
+        header.set_title_widget(switcher)
 
         settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
         settings_btn.set_tooltip_text("Paramètres")
         settings_btn.connect("clicked", self.on_settings_clicked)
         header.pack_end(settings_btn)
 
-        self.window.set_titlebar(header)
-
-        # ===== CONTENU =====
-        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
-        main_box.set_margin_top(20)
-        main_box.set_margin_bottom(20)
-        main_box.set_margin_start(20)
-        main_box.set_margin_end(20)
-        main_box.set_halign(Gtk.Align.CENTER)
-        main_box.set_size_request(700, -1)  # Largeur min, pas de hauteur min
-
-        main_box.append(self._build_source_section())
-        main_box.append(self._build_queue_section())
-        main_box.append(self._build_transcripts_section())
-        main_box.append(self._build_status_section())
-
-        # Wrapper dans un ScrolledWindow pour le redimensionnement
-        scrolled = Gtk.ScrolledWindow(
-            hscrollbar_policy=Gtk.PolicyType.NEVER,
-            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
-            child=main_box,
+        # Bannière quand la clé API manque
+        self.api_banner = Adw.Banner(
+            title="Aucune clé API Mistral configurée — les transcriptions seront impossibles",
+            button_label="Configurer",
         )
-        scrolled.set_vexpand(True)
+        self.api_banner.connect("button-clicked",
+                                lambda *_: self.on_settings_clicked(None))
+        self.api_banner.set_revealed(not self.api_key)
+
+        # ===== CONTENU : deux pages =====
+        self.stack.add_titled_with_icon(
+            self._build_transcribe_page(), "transcribe", "Transcrire",
+            "audio-input-microphone-symbolic")
+        self.stack.add_titled_with_icon(
+            self._build_library_page(), "library", "Bibliothèque",
+            "folder-documents-symbolic")
+
+        toolbar_view = Adw.ToolbarView()
+        toolbar_view.add_top_bar(self.api_banner)
+        toolbar_view.add_top_bar(header)
+        toolbar_view.set_content(self.stack)
+        toolbar_view.add_bottom_bar(self._build_footer_bar())
 
         # Toasts pour les retours utilisateur (succès, erreurs, annulations)
-        self.toast_overlay = Adw.ToastOverlay(child=scrolled)
+        self.toast_overlay = Adw.ToastOverlay(child=toolbar_view)
         self.window.set_child(self.toast_overlay)
 
         self.setup_accelerators()
@@ -186,12 +330,26 @@ class VoxCastWindow:
 
         self.window.present()
 
+    def _load_css(self):
+        """Charge la feuille de style custom de VoxCast."""
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CUSTOM_CSS.encode("utf-8"))
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
     # ========================================================================
     # DRAG & DROP
     # ========================================================================
 
     def on_drop_file(self, target, value, x, y):
         """Gère le drop d'un fichier audio ou d'une URL."""
+        self.window.remove_css_class("drag-hover")
+        # Ramener l'utilisateur sur la page de transcription
+        if hasattr(self, "stack"):
+            self.stack.set_visible_child_name("transcribe")
         if hasattr(value, "get_files"):
             # Gdk.FileList
             for file_info in value.get_files():
@@ -203,6 +361,13 @@ class VoxCastWindow:
             self.url_entry.set_text(value)
             self._check_source_type()
 
+    def _on_drag_enter(self, target, x, y):
+        self.window.add_css_class("drag-hover")
+        return Gdk.DragAction.COPY
+
+    def _on_drag_leave(self, target):
+        self.window.remove_css_class("drag-hover")
+
     def _check_source_type(self):
         """Vérifie si la source est une URL ou un fichier local."""
         source = self.url_entry.get_text().strip()
@@ -212,6 +377,74 @@ class VoxCastWindow:
     # ========================================================================
     # CONSTRUCTION DES SECTIONS
     # ========================================================================
+
+    def _build_hero(self) -> Gtk.Widget:
+        """Bandeau d'accueil en haut de la page Transcrire."""
+        hero = Gtk.Box(spacing=16, halign=Gtk.Align.START, margin_bottom=6)
+
+        badge = Gtk.Box(css_classes=["hero-badge"])
+        badge.append(Gtk.Image(icon_name="audio-x-generic-symbolic", pixel_size=34))
+
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                         valign=Gtk.Align.CENTER)
+        title = Gtk.Label(
+            label="VoxCast",
+            halign=Gtk.Align.START,
+            css_classes=["hero-title"],
+        )
+        subtitle = Gtk.Label(
+            label="Transcrivez vos vidéos et fichiers audio en Markdown — propulsé par Voxtral.",
+            halign=Gtk.Align.START,
+            css_classes=["dim-label"],
+        )
+        titles.append(title)
+        titles.append(subtitle)
+
+        hero.append(badge)
+        hero.append(titles)
+        return hero
+
+    def _build_transcribe_page(self) -> Gtk.Widget:
+        """Page 'Transcrire' : hero + source + file d'attente."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        box.set_margin_top(24)
+        box.set_margin_bottom(24)
+        box.set_margin_start(20)
+        box.set_margin_end(20)
+
+        box.append(self._build_hero())
+        box.append(self._build_source_section())
+        box.append(self._build_queue_section())
+
+        clamp = Adw.Clamp(maximum_size=860, child=box)
+        scrolled = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            child=clamp,
+        )
+        scrolled.set_vexpand(True)
+        return scrolled
+
+    def _build_library_page(self) -> Gtk.Widget:
+        """Page 'Bibliothèque' : liste des transcriptions + recherche."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                       vexpand=True)
+        box.set_margin_top(24)
+        box.set_margin_bottom(24)
+        box.set_margin_start(20)
+        box.set_margin_end(20)
+
+        box.append(self._build_transcripts_section())
+
+        clamp = Adw.Clamp(maximum_size=860, child=box)
+        clamp.set_vexpand(True)
+        scrolled = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            child=clamp,
+        )
+        scrolled.set_vexpand(True)
+        return scrolled
 
     def _build_source_section(self) -> Adw.PreferencesGroup:
         group = Adw.PreferencesGroup(title="Nouvelle transcription")
@@ -371,18 +604,35 @@ class VoxCastWindow:
 
         self.queue_list = Gtk.ListBox(
             selection_mode=Gtk.SelectionMode.SINGLE,
-            show_separators=True,
-            css_classes=["navigation-sidebar"],
+            css_classes=["voxcast-list"],
         )
 
-        scrolled = Gtk.ScrolledWindow(
+        list_scrolled = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER,
             vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
             child=self.queue_list,
         )
-        scrolled.set_size_request(-1, 120)
+        list_scrolled.set_size_request(-1, 200)
+        list_scrolled.set_vexpand(True)
 
-        group.add(scrolled)
+        # État vide avec call-to-action
+        empty_page = Adw.StatusPage(
+            icon_name="list-add-symbolic",
+            title="File d'attente vide",
+            description="Ajoutez une URL YouTube ou un fichier audio ci-dessus pour commencer.",
+        )
+        browse_empty_btn = Gtk.Button(label="Parcourir un fichier audio")
+        browse_empty_btn.connect("clicked", self.on_browse_audio)
+        empty_page.set_child(browse_empty_btn)
+
+        self.queue_stack = Gtk.Stack()
+        self.queue_stack.add_named(empty_page, "empty")
+        self.queue_stack.add_named(list_scrolled, "list")
+        self.queue_stack.set_size_request(-1, 240)
+        self.queue_stack.set_vexpand(True)
+        self.queue_stack.set_visible_child_name("empty")
+
+        group.add(self.queue_stack)
         return group
 
     def _build_transcripts_section(self) -> Adw.PreferencesGroup:
@@ -408,41 +658,72 @@ class VoxCastWindow:
 
         self.transcripts_list = Gtk.ListBox(
             selection_mode=Gtk.SelectionMode.SINGLE,
-            show_separators=True,
-            css_classes=["navigation-sidebar"],
+            css_classes=["voxcast-list"],
         )
         # Double-clic sur une ligne -> ouvrir la transcription
         self.transcripts_list.connect("row-activated", self._on_transcript_activated)
 
-        scrolled = Gtk.ScrolledWindow(
+        list_scrolled = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER,
             vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
             child=self.transcripts_list,
         )
-        scrolled.set_size_request(-1, 150)
+        list_scrolled.set_vexpand(True)
 
-        group.add(scrolled)
+        # États vides
+        empty_page = Adw.StatusPage(
+            icon_name="folder-documents-symbolic",
+            title="Aucune transcription",
+            description="Les fichiers Markdown apparaîtront ici après le traitement de la file.",
+        )
+        open_folder_btn = Gtk.Button(label="Ouvrir le dossier")
+        open_folder_btn.connect("clicked", self.on_open_folder_clicked)
+        empty_page.set_child(open_folder_btn)
+
+        no_results_page = Adw.StatusPage(
+            icon_name="edit-find-symbolic",
+            title="Aucun résultat",
+            description="Aucune transcription ne correspond à cette recherche.",
+        )
+
+        self.transcripts_stack = Gtk.Stack()
+        self.transcripts_stack.add_named(empty_page, "empty")
+        self.transcripts_stack.add_named(no_results_page, "no-results")
+        self.transcripts_stack.add_named(list_scrolled, "list")
+        self.transcripts_stack.set_vexpand(True)
+        self.transcripts_stack.set_visible_child_name("empty")
+
+        group.add(self.transcripts_stack)
         return group
 
-    def _build_status_section(self) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup()
-
-        self.progress_bar = Gtk.ProgressBar(
-            halign=Gtk.Align.FILL,
-            visible=False,
-            margin_bottom=10,
-        )
-        group.add(self.progress_bar)
+    def _build_footer_bar(self) -> Gtk.Widget:
+        """Barre de statut fixe en pied de fenêtre (progression globale)."""
+        bar = Gtk.Box(spacing=14, halign=Gtk.Align.FILL, css_classes=["status-bar"])
 
         self.status_label = Gtk.Label(
             label="Prêt",
             halign=Gtk.Align.START,
-            margin_bottom=5,
+            hexpand=True,
+            ellipsize=Pango.EllipsizeMode.END,
+            css_classes=["heading"],
         )
-        self.status_label.add_css_class("title-4")
-        group.add(self.status_label)
+        self.progress_bar = Gtk.ProgressBar(
+            css_classes=["voxcast-progress"],
+            width_request=220,
+            valign=Gtk.Align.CENTER,
+            visible=False,
+        )
+        self.eta_label = Gtk.Label(
+            label="",
+            halign=Gtk.Align.END,
+            width_request=120,
+            css_classes=["caption", "dim-label"],
+        )
 
-        return group
+        bar.append(self.status_label)
+        bar.append(self.progress_bar)
+        bar.append(self.eta_label)
+        return bar
 
     # ========================================================================
     # RACCOURCIS CLAVIER
@@ -623,45 +904,54 @@ class VoxCastWindow:
         self.start_btn.set_sensitive(len(pending) > 0 and not self.running)
 
     def _create_queue_row(self, item: QueueItem, index: int) -> Gtk.Widget:
-        box = Gtk.Box(spacing=10, halign=Gtk.Align.FILL, margin_top=6, margin_bottom=6)
+        box = Gtk.Box(spacing=12, halign=Gtk.Align.FILL,
+                      margin_top=8, margin_bottom=8, margin_start=10, margin_end=10)
 
-        # Icône selon le type
-        icon_name = "audio-x-generic-symbolic" if item.is_local else "media-playlist-repeat-symbolic"
-        icon = Gtk.Image(icon_name=icon_name, pixel_size=20, valign=Gtk.Align.CENTER)
+        # Badge d'icône selon le type de source
+        icon_name = "audio-x-generic-symbolic" if item.is_local else "video-display-symbolic"
+        badge = Gtk.Box(css_classes=["icon-badge", "badge-accent"],
+                        valign=Gtk.Align.CENTER)
+        badge.append(Gtk.Image(icon_name=icon_name, pixel_size=20))
+        box.append(badge)
 
-        # Info + barre de progression de l'item
-        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        # Info + pastille de statut + barre de progression de l'item
+        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                           hexpand=True, valign=Gtk.Align.CENTER)
         name_label = Gtk.Label(
             label=item.options.get("output_name") or Path(item.source).name or item.source,
             halign=Gtk.Align.START,
             ellipsize=Pango.EllipsizeMode.END,
             max_width_chars=50,
+            css_classes=["row-title"],
         )
 
-        status_text = STATUS_LABELS.get(item.status, item.status)
-        if item.status == STATUS_ERROR and item.error:
-            status_text = f"Erreur : {item.error}"
+        status_row = Gtk.Box(spacing=8, halign=Gtk.Align.START)
         status_label = Gtk.Label(
-            label=status_text,
+            label=STATUS_LABELS.get(item.status, item.status),
             halign=Gtk.Align.START,
-            ellipsize=Pango.EllipsizeMode.END,
-            max_width_chars=50,
+            css_classes=["status-pill", f"pill-{item.status}"],
         )
-        status_label.add_css_class("caption")
-        css = STATUS_COLORS.get(item.status, "")
-        if css:
-            status_label.add_css_class(css)
+        status_row.append(status_label)
+        if item.status == STATUS_ERROR and item.error:
+            error_label = Gtk.Label(
+                label=item.error,
+                halign=Gtk.Align.START,
+                ellipsize=Pango.EllipsizeMode.END,
+                max_width_chars=40,
+                css_classes=["caption", "dim-label"],
+            )
+            status_row.append(error_label)
 
         progress_bar = Gtk.ProgressBar(
+            css_classes=["voxcast-progress"],
             halign=Gtk.Align.FILL,
             show_text=False,
             visible=(item.status == STATUS_RUNNING),
             fraction=item.progress or 0.0,
-            margin_top=2,
         )
 
         info_box.append(name_label)
-        info_box.append(status_label)
+        info_box.append(status_row)
         info_box.append(progress_bar)
         item.status_label = status_label
         item.progress_bar = progress_bar
@@ -688,7 +978,6 @@ class VoxCastWindow:
         menu_btn.insert_action_group("item", actions)
         menu_btn.set_sensitive(menu.get_n_items() > 0)
 
-        box.append(icon)
         box.append(info_box)
         box.append(menu_btn)
 
@@ -994,7 +1283,6 @@ class VoxCastWindow:
         actions.add_action(act)
         menu_btn.insert_action_group("tr", actions)
 
-        box.append(icon)
         box.append(info_box)
         box.append(menu_btn)
 
@@ -1274,6 +1562,8 @@ class VoxCastWindow:
                 if key:
                     self.api_key = key
                     self.save_settings()
+                    if hasattr(self, "api_banner"):
+                        self.api_banner.set_revealed(False)
                     self.toast("Clé API enregistrée.", "success")
                     on_success()
             d.destroy()
