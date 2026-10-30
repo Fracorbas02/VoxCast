@@ -160,6 +160,25 @@ Les transcriptions sont sauvegardées dans `transcripts/` au format Markdown.
 
 Note : `--timestamps` et `--language` ne sont pas compatibles simultanément (limitation API Mistral).
 
+## Serveur MCP (stdio)
+
+VoxCast embarque un serveur [MCP](https://modelcontextprotocol.io) (Model Context Protocol) qui expose ses transcriptions à n'importe quel client compatible (Claude Desktop, Mistral Le Chat, etc.) :
+
+```json
+{
+  "mcpServers": {
+    "voxcast": {
+      "command": "python3",
+      "args": ["/chemin/vers/VoxCast/mcp_server.py"]
+    }
+  }
+}
+```
+
+Outils exposés : `list_transcripts`, `get_transcript`, `search_transcripts`, `summarize`, `transcribe`.
+
+La clé API est lue dans `settings.json` (ou `MISTRAL_API_KEY`), le dossier des transcriptions dans `transcripts_dir` (défaut `./transcripts`).
+
 ## Structure du projet
 
 ```
@@ -167,6 +186,7 @@ VoxCast/
 ├── main.py              # Point d'entrée GUI (GTK4)
 ├── window.py            # Interface graphique (GTK4 + Libadwaita)
 ├── video_to_text.py     # Logique principale (CLI + pipeline)
+├── mcp_server.py        # Serveur MCP stdio (transcriptions, résumés, recherche)
 ├── requirements.txt     # Dépendances (yt-dlp, mistralai, PyGObject)
 ├── settings.json        # Paramètres utilisateur (généré)
 ├── .cache.json          # Cache des métadonnées YouTube (généré)
