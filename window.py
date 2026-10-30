@@ -777,6 +777,10 @@ class VoxCastWindow:
                     auto_name = vtt.sanitize_filename(Path(source).stem)
                     self.name_entry.set_text(auto_name)
             elif source.startswith("http"):
+                if vtt.is_playlist_url(source):
+                    self.cost_label.set_label(
+                        "Playlist détectée — cliquez sur « Ajouter » pour choisir les vidéos.")
+                    return
                 # Pour les URLs, on fetch les infos (avec cache)
                 info = vtt.get_video_info_cached(source)
                 duration = info.get("duration", 0)
@@ -883,21 +887,148 @@ class VoxCastWindow:
         self.toast(f"Ajouté à la file : {Path(source).name}")
         self.start_btn.set_sensitive(len(self.queue) > 0)
 
+    # ========================================================================
+    # PLAYLIST YOUTUBE
+    # ========================================================================
+
+    def _open_playlist_dialog(self, url: str):
+        """Ouvre un dialogue listant les vidéos d'une playlist YouTube."""
+        dialog = Adw.Window(
+            transient_for=self.window,
+            modal=True,
+            title="Ajouter une playlist",
+            default_width=620,
+            default_height=560,
+        )
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Gtk.Label(label="Playlist YouTube", css_classes=["title-4"]))
+        toolbar.add_top_bar(header)
+
+        # État de chargement
+        loading_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                              halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER,
+                              vexpand=True)
+        spinner = Adw.Spinner()
+        spinner.set_size_request(48, 48)
+        loading_box.append(spinner)
+        loading_box.append(Gtk.Label(label="Chargement de la playlist...",
+                                      css_classes=["dim-label"]))
+        toolbar.set_content(loading_box)
+
+        dialog.set_content(toolbar)
+        dialog.present()
+
+        def work():
+            try:
+                playlist = vtt.get_playlist_entries(url)
+                GLib.idle_add(self._fill_playlist_dialog, dialog, toolbar, playlist)
+            except Exception as e:
+                GLib.idle_add(self.toast, f"Playlist illisible : {e}", "error", 6)
+                GLib.idle_add(dialog.close)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _fill_playlist_dialog(self, dialog, toolbar, playlist: dict):
+        entries = playlist.get("entries", [])
+        title = playlist.get("title", "Playlist")
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+
+        total_dur = sum(e.get("duration", 0) for e in entries)
+        subtitle = Gtk.Label(
+            label=f"{title} — {len(entries)} vidéo(s), {vtt.format_timestamp(total_dur)} au total",
+            halign=Gtk.Align.START,
+            ellipsize=Pango.EllipsizeMode.END,
+            css_classes=["heading"],
+        )
+        content.append(subtitle)
+
+        list_box = Gtk.ListBox(
+            selection_mode=Gtk.SelectionMode.MULTIPLE,
+            css_classes=["voxcast-list"],
+        )
+        for e in entries:
+            row_box = Gtk.Box(spacing=10, margin_top=6, margin_bottom=6,
+                              margin_start=10, margin_end=10)
+            dur = e.get("duration", 0)
+            dur_str = vtt.format_timestamp(dur) if dur else "?"
+            info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+            info.append(Gtk.Label(label=e["title"], halign=Gtk.Align.START,
+                                  ellipsize=Pango.EllipsizeMode.END, max_width_chars=60,
+                                  css_classes=["row-title"]))
+            info.append(Gtk.Label(label=dur_str, halign=Gtk.Align.START,
+                                  css_classes=["caption", "dim-label"]))
+            row_box.append(info)
+            row = Gtk.ListBoxRow(child=row_box, activatable=True)
+            row.entry = e
+            list_box.append(row)
+            list_box.select_row(row)  # tout pré-sélectionner
+
+        scrolled = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            child=list_box,
+        )
+        scrolled.set_vexpand(True)
+        content.append(scrolled)
+
+        # Barre d'actions
+        actions = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        select_all = Gtk.Button(label="Tout sélectionner")
+        select_all.connect("clicked", lambda *_: list_box.select_all())
+        select_none = Gtk.Button(label="Tout désélectionner")
+        select_none.connect("clicked", lambda *_: list_box.unselect_all())
+        add_btn = Gtk.Button(label="Ajouter", css_classes=["suggested-action"])
+        add_btn.connect("clicked", lambda *_: self._add_playlist_selection(
+            dialog, list_box, entries))
+        actions.append(select_all)
+        actions.append(select_none)
+        actions.append(add_btn)
+        content.append(actions)
+
+        toolbar.set_content(content)
+        return False
+
+    def _add_playlist_selection(self, dialog, list_box, entries: list[dict]):
+        selected_rows = list_box.get_selected_rows()
+        selected_entries = [getattr(r, "entry") for r in selected_rows]
+        if not selected_entries:
+            self.toast("Sélectionnez au moins une vidéo.")
+            return
+
+        options = self._collect_options()
+        added = 0
+        for e in selected_entries:
+            opts = dict(options)
+            opts["output_name"] = vtt.sanitize_filename(e["title"])
+            item = QueueItem(source=e["url"], is_local=False, options=opts)
+            item.duration = e.get("duration") or None
+            self.queue.append(item)
+            added += 1
+
+        self._refresh_queue_list()
+        self.start_btn.set_sensitive(len(self.queue) > 0)
+        self.toast(f"{added} vidéo(s) ajoutée(s) à la file", "success")
+        self.url_entry.set_text("")
+        self.name_entry.set_text("")
+        self.cost_label.set_label("")
+        dialog.close()
+
     def _refresh_queue_list(self):
         """Met à jour visuellement la file d'attente."""
         for row in list(self.queue_list):
             self.queue_list.remove(row)
 
         if not self.queue:
-            empty = Gtk.Label(
-                label="File vide — ajoutez une URL ou un fichier ci-dessus",
-                halign=Gtk.Align.CENTER,
-                margin_top=8,
-                margin_bottom=8,
-            )
-            empty.add_css_class("dim-label")
-            self.queue_list.append(empty)
+            self.queue_stack.set_visible_child_name("empty")
             return
+        self.queue_stack.set_visible_child_name("list")
 
         for i, item in enumerate(self.queue):
             row = self._create_queue_row(item, i)
