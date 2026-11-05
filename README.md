@@ -20,7 +20,7 @@ Le fichier de sortie est structuré pour être directement exploitable par un ou
 - **Timestamps** optionnels (par segment ou par mot)
 - **Context biasing** (jusqu'à 100 termes pour guider la transcription de noms propres)
 - Détection automatique de la langue ou forçage manuel (13 langues)
-- **Découpage automatique** des vidéos longues (>3h) en chunks, transcription séparée puis fusion en un seul fichier
+- **Découpage automatique** des audios longs en chunks (~1h14, sous la limite de contexte de 65536 tokens de Voxtral Transcribe ≈ 1h27 par requête), transcription séparée puis fusion en un seul fichier
 - **Découpage parallèle** des chunks via ffmpeg multi-threaded (tous les coeurs CPU)
 - **Reprise sur échec** : retry automatique des chunks échoués (3 tentatives)
 - **Cache des métadonnées** : évite de re-fetcher les infos YouTube

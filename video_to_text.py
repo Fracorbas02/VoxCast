@@ -57,11 +57,20 @@ MISTRAL_TRANSCRIBE_MODELS = [
 SUMMARY_MODEL = "mistral-large-latest"
 # Taille max d'un extrait envoyé au modèle pour le résumé (map-reduce)
 SUMMARY_CHUNK_CHARS = 30000
-MAX_AUDIO_HOURS = 3
-MAX_AUDIO_SECONDS = MAX_AUDIO_HOURS * 3600
 MAX_FILE_SIZE_MB = 500
-CHUNK_HOURS = 2.75
-CHUNK_SECONDS = int(CHUNK_HOURS * 3600)
+# Limite de contexte audio des modèles Voxtral Transcribe : 65536 tokens par
+# requête (erreur "Prompt N > 65536 maximum context length" au-delà).
+# Mesuré sur voxtral-small-transcribe-3-0 : ~12,5 tokens par seconde d'audio
+# (123753 tokens pour un chunk de 2h45), soit une limite réelle d'environ
+# 1h27 par requête — et non 3h. On découpe en chunks de ~1h14 (marge ~15%).
+VOXTRAL_CONTEXT_TOKENS = 65536
+AUDIO_TOKENS_PER_SECOND = 12.5
+MAX_REQUEST_SECONDS = int(VOXTRAL_CONTEXT_TOKENS / AUDIO_TOKENS_PER_SECOND)  # ~1h27
+CHUNK_SECONDS = int(MAX_REQUEST_SECONDS * 0.85)  # ~1h14
+CHUNK_HOURS = CHUNK_SECONDS / 3600
+# Taille minimale d'un chunk pour autoriser un re-découpage après un rejet
+# "contexte trop long" de l'API (évite de boucler sur un chunk déjà petit).
+MIN_CHUNK_SECONDS = 600
 AUDIO_BITRATE = "128K"
 COST_PER_MIN = 0.004  # Voxtral Small Transcribe 3 : $0.004/min (batch)
 MAX_RETRIES = 3
@@ -386,9 +395,11 @@ def download_audio(url: str, output_dir: Path, use_cache: bool = True,
     print(f"Durée    : {timedelta(seconds=duration)}")
     print(f"Coût est. : ${estimate_cost(duration):.2f}")
 
-    if duration > MAX_AUDIO_HOURS * 3600:
-        print(f"Attention: la vidéo dure {duration // 3600}h, "
-              f"la limite Mistral est de {MAX_AUDIO_HOURS}h par requête.")
+    if duration > MAX_REQUEST_SECONDS:
+        print(f"Attention: la vidéo dure {timedelta(seconds=duration)}, au-delà de la "
+              f"limite d'une requête Voxtral ({timedelta(seconds=MAX_REQUEST_SECONDS)} "
+              f"de contexte audio) : découpage en chunks de "
+              f"~{timedelta(seconds=CHUNK_SECONDS)}.")
 
     filename = sanitize_filename(title)
 
@@ -526,13 +537,13 @@ def get_audio_duration_seconds(audio_path: Path) -> float:
 # Découpage
 # ---------------------------------------------------------------------------
 
-def _split_one_chunk(args: tuple[str, str, str, int, float]) -> tuple[str, float]:
-    mp3_path, chunk_path, bitrate, _, start = args
+def _split_one_chunk(args: tuple[str, str, str, int, float, int, float]) -> tuple[str, float]:
+    mp3_path, chunk_path, bitrate, _, start, chunk_seconds, end = args
     cmd = [
         "ffmpeg", "-y", "-v", "quiet",
         "-i", mp3_path,
         "-ss", str(start),
-        "-t", str(CHUNK_SECONDS),
+        "-to", str(end),
         "-c:a", "libmp3lame", "-b:a", bitrate,
         "-threads", "0",
         chunk_path,
@@ -544,12 +555,15 @@ def _split_one_chunk(args: tuple[str, str, str, int, float]) -> tuple[str, float
 def split_audio(mp3_path: Path, output_dir: Path,
                 start: Optional[float] = None,
                 end: Optional[float] = None,
-                phase_progress=None) -> list[tuple[Path, float]]:
+                phase_progress=None,
+                chunk_seconds: Optional[int] = None) -> list[tuple[Path, float]]:
     """
-    Découpe un fichier audio en chunks de CHUNK_SECONDS secondes.
+    Découpe un fichier audio en chunks de chunk_seconds secondes
+    (défaut: CHUNK_SECONDS, calculé sous la limite de contexte du modèle).
     Si start/end sont donnés, ne découpe que ce segment.
     phase_progress(frac_0_1, message) est appelé à chaque chunk produit.
     """
+    cs = chunk_seconds or CHUNK_SECONDS
     output_dir.mkdir(parents=True, exist_ok=True)
     total_duration = get_audio_duration_seconds(mp3_path)
 
@@ -563,30 +577,31 @@ def split_audio(mp3_path: Path, output_dir: Path,
         actual_end = total_duration
 
     segment_duration = actual_end - actual_start
-    if segment_duration <= MAX_AUDIO_SECONDS:
+    if segment_duration <= cs:
         # Pas besoin de découper, un seul chunk
         return [(mp3_path, actual_start)]
 
-    num_chunks = int(segment_duration // CHUNK_SECONDS) + 1
+    num_chunks = int(segment_duration // cs) + 1
     num_workers = min(num_chunks, os.cpu_count() or 4)
-    print(f"Découpage en {num_chunks} chunks de ~{CHUNK_HOURS}h "
+    print(f"Découpage en {num_chunks} chunks de ~{timedelta(seconds=cs)} "
           f"({num_workers} workers en parallèle)...")
 
     stem = mp3_path.stem
     tasks = []
     for i in range(num_chunks):
-        chunk_start = actual_start + i * CHUNK_SECONDS
+        chunk_start = actual_start + i * cs
         if chunk_start >= actual_end:
             break
         chunk_path = output_dir / f"{stem}_part{i+1}.mp3"
-        tasks.append((str(mp3_path), str(chunk_path), AUDIO_BITRATE, i, float(chunk_start)))
+        tasks.append((str(mp3_path), str(chunk_path), AUDIO_BITRATE, i,
+                      float(chunk_start), cs, min(actual_end, chunk_start + cs)))
 
     chunks = []
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         results = executor.map(_split_one_chunk, tasks)
         for i, (chunk_path_str, chunk_start) in enumerate(results, 1):
             chunk_path = Path(chunk_path_str)
-            chunk_dur = min(CHUNK_SECONDS, actual_end - chunk_start)
+            chunk_dur = min(cs, actual_end - chunk_start)
             chunks.append((chunk_path, chunk_start))
             chunk_mb = chunk_path.stat().st_size / (1024 * 1024)
             print(f"  Chunk {i}/{len(tasks)}: {chunk_path.name} "
@@ -691,6 +706,15 @@ def transcribe_with_retry(
                 time.sleep(RETRY_DELAY)
             else:
                 raise
+
+
+def is_context_length_error(e: BaseException) -> bool:
+    """True si l'erreur API signifie que l'audio dépasse le contexte du modèle
+    (Voxtral: 'Prompt N > 65536 maximum context length', code 3059)."""
+    msg = str(e)
+    return ("maximum context length" in msg
+            or "invalid_request_prompt_too_long" in msg
+            or "3059" in msg)
 
 
 # ---------------------------------------------------------------------------
@@ -1368,7 +1392,7 @@ def run_pipeline(
             raise InterruptedError("Annulé par l'utilisateur")
 
         audio_duration = get_audio_duration_seconds(mp3_path)
-        needs_split = audio_duration > MAX_AUDIO_SECONDS
+        needs_split = audio_duration > CHUNK_SECONDS
         split_start, split_end = audio_end, audio_end + 0.05
 
         if needs_split:
@@ -1427,17 +1451,48 @@ def run_pipeline(
             if total > 1:
                 _log(f"Transcription chunk {i}/{total}...")
             t0 = time.monotonic()
-            result = transcribe_with_retry(
-                mp3_path=chunk_path,
-                api_key=api_key,
-                language=language,
-                diarize=diarize,
-                timestamp_granularities=timestamp_granularities,
-                context_bias=context_bias,
-                model=model,
-                base_url=base_url,
-                model_api_key=model_api_key,
-            )
+            try:
+                result = transcribe_with_retry(
+                    mp3_path=chunk_path,
+                    api_key=api_key,
+                    language=language,
+                    diarize=diarize,
+                    timestamp_granularities=timestamp_granularities,
+                    context_bias=context_bias,
+                    model=model,
+                    base_url=base_url,
+                    model_api_key=model_api_key,
+                )
+            except Exception as e:
+                if not (is_context_length_error(e) and chunk_dur >= 2 * MIN_CHUNK_SECONDS):
+                    raise
+                # Le chunk dépasse le contexte du modèle : re-découpage en deux
+                # et transcription des sous-chunks (offsets ajustés à la volée).
+                _log(f"Chunk {i}/{total} trop long pour le contexte du modèle, "
+                     f"re-découpage en deux...")
+                sub_chunks = split_audio(
+                    chunk_path, TEMP_DIR / "chunks",
+                    start=0.0, end=chunk_dur,
+                    chunk_seconds=int(chunk_dur // 2),
+                )
+                for sub_path, sub_start in sub_chunks:
+                    sub_result = transcribe_with_retry(
+                        mp3_path=sub_path,
+                        api_key=api_key,
+                        language=language,
+                        diarize=diarize,
+                        timestamp_granularities=timestamp_granularities,
+                        context_bias=context_bias,
+                        model=model,
+                        base_url=base_url,
+                        model_api_key=model_api_key,
+                    )
+                    results.append((sub_result, offset + sub_start))
+                    _log(f"  Sous-chunk [{format_timestamp(offset + sub_start)}] "
+                         f"transcrit: {len(sub_result.get('text', ''))} caractères")
+            else:
+                results.append((result, offset))
+                _log(f"Chunk {i}/{total} transcrit: {len(result.get('text', ''))} caractères")
             elapsed = time.monotonic() - t0
             if chunk_dur > 0:
                 speed = 0.5 * speed + 0.5 * (elapsed / chunk_dur)
@@ -1445,10 +1500,6 @@ def run_pipeline(
             rep.stop_ticker()
             acc += chunk_dur
             rep.set(chunk_base + chunk_span)
-
-            results.append((result, offset))
-            text = result.get("text", "")
-            _log(f"Chunk {i}/{total} transcrit: {len(text)} caractères")
 
         # Apprentissage : on enregistre le temps réel de la phase de transcription
         transcribe_elapsed = time.monotonic() - transcribe_wall_start
@@ -1494,10 +1545,16 @@ def run_pipeline(
             for c, _ in audio_files:
                 if c.resolve().is_relative_to(temp_dir):
                     c.unlink(missing_ok=True)
-            try:
-                (TEMP_DIR / "chunks").rmdir()
-            except OSError:
-                pass
+            # Sous-chunks produits par un re-découpage après rejet API
+            chunks_dir = TEMP_DIR / "chunks"
+            if chunks_dir.is_dir():
+                for f in chunks_dir.iterdir():
+                    if f.is_file():
+                        f.unlink(missing_ok=True)
+                try:
+                    chunks_dir.rmdir()
+                except OSError:
+                    pass
             try:
                 TEMP_DIR.rmdir()
             except OSError:
