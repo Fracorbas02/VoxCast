@@ -656,6 +656,11 @@ def transcribe_audio(
     }
     if language:
         kwargs["language"] = language
+    if not base_url and diarize:
+        # L'API Voxtral exige timestamp_granularities=['segment'] quand
+        # diarize=True hors streaming (sinon erreur 422).
+        if not timestamp_granularities or "segment" not in timestamp_granularities:
+            timestamp_granularities = ["segment"]
     if timestamp_granularities:
         kwargs["timestamp_granularities"] = timestamp_granularities
     if not base_url:
