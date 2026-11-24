@@ -910,17 +910,21 @@ SPEAKER_REF_MAX_CLIPS = 8
 
 
 def build_speaker_references(chunk_path: Path, result: dict,
-                             work_dir: Path) -> dict[str, str]:
+                             work_dir: Path) -> tuple[dict[str, str], dict[str, str]]:
     """Construit les speaker_references {label: base64} à partir des segments
     diarisé d'un chunk : pour chaque locuteur, on extrait le plus long de ses
     segments (borné à 15 s, ignoré s'il fait moins de 3 s). Ces clips ancrent
-    les labels de locuteurs pour les chunks suivants."""
+    les labels de locuteurs pour les chunks suivants.
+    Retourne aussi {label: texte du segment source} : l'API compte les clips de
+    référence dans le prompt audio et peut les retranscrire comme du contenu —
+    le texte source sert à filtrer ces échos dans les réponses suivantes."""
     by_speaker: dict[str, list[dict]] = {}
     for seg in result.get("segments", []) or []:
         spk = seg.get("speaker_id") or seg.get("speaker")
         if spk:
             by_speaker.setdefault(str(spk), []).append(seg)
     refs: dict[str, str] = {}
+    ref_texts: dict[str, str] = {}
     refs_dir = work_dir / "speaker_refs"
     refs_dir.mkdir(parents=True, exist_ok=True)
     for spk, segs in by_speaker.items():
@@ -938,7 +942,92 @@ def build_speaker_references(chunk_path: Path, result: dict,
             print(f"  Clip de référence '{spk}' ignoré ({e})")
             continue
         refs[spk] = base64.b64encode(ref_path.read_bytes()).decode("ascii")
-    return refs
+        ref_texts[spk] = (seg.get("text") or "").strip()
+    return refs, ref_texts
+
+
+def _norm_text(t: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", (t or "").lower())).strip()
+
+
+def filter_echo_segments(result: dict, ref_texts: dict[str, str],
+                         threshold: float = 0.7) -> int:
+    """Supprime les segments 'écho' d'une réponse : l'API Voxtral intègre les
+    clips speaker_references au prompt audio et les retranscrit parfois comme
+    du contenu. Un segment est purgé si son texte matche (contenance ou
+    similarité >= threshold) le texte d'un clip de référence."""
+    ref_norms = [_norm_text(t) for t in ref_texts.values() if t]
+    if not ref_norms:
+        return 0
+    from difflib import SequenceMatcher
+    segs = result.get("segments") or []
+    kept, removed = [], 0
+    for seg in segs:
+        t = _norm_text(seg.get("text", ""))
+        is_echo = bool(t) and any(
+            (r and (t in r or r in t)) or SequenceMatcher(None, t, r).ratio() >= threshold
+            for r in ref_norms)
+        if is_echo:
+            removed += 1
+        else:
+            kept.append(seg)
+    if removed:
+        result["segments"] = kept
+        result["text"] = " ".join(s.get("text", "") for s in kept).strip()
+    return removed
+
+
+def dedupe_repeat_segments(result: dict, max_len: int = 80) -> int:
+    """Supprime les répétitions consécutives strictement identiques de courts
+    segments même locuteur (boucles dégénérées du décodeur, type « Oui. » x6)."""
+    segs = result.get("segments") or []
+    kept, removed = [], 0
+    for seg in segs:
+        t = _norm_text(seg.get("text", ""))
+        prev = kept[-1] if kept else None
+        if (prev is not None and t and len(t) <= max_len
+                and _norm_text(prev.get("text", "")) == t
+                and (seg.get("speaker_id") or seg.get("speaker"))
+                == (prev.get("speaker_id") or prev.get("speaker"))):
+            removed += 1
+            continue
+        kept.append(seg)
+    if removed:
+        result["segments"] = kept
+        result["text"] = " ".join(s.get("text", "") for s in kept).strip()
+    return removed
+
+
+def merge_orphan_speakers(results: list[tuple[dict, float]],
+                          known_labels: set[str]) -> dict[str, str]:
+    """Fusionne les labels orphelins (ex. speaker_5 créé par l'API uniquement en
+    fin de fichier) vers le label qui parlait juste avant leur première
+    occurrence. Ne s'applique que quand des speaker_references ont ancré les
+    labels (known_labels non vide)."""
+    if not known_labels:
+        return {}
+    flat = []
+    for result, offset in results:
+        for seg in result.get("segments", []) or []:
+            spk = seg.get("speaker_id") or seg.get("speaker")
+            if spk:
+                flat.append((float(seg.get("start", 0.0)) + offset, str(spk), seg))
+    flat.sort(key=lambda x: x[0])
+    orphans = {lbl for _, lbl, _ in flat} - known_labels
+    mapping: dict[str, str] = {}
+    for orphan in orphans:
+        first_start = min(s for s, lbl, _ in flat if lbl == orphan)
+        prev = [lbl for s, lbl, _ in flat if s < first_start and lbl != orphan]
+        if prev:
+            mapping[orphan] = prev[-1]
+    for _, _, seg in flat:
+        spk = seg.get("speaker_id") or seg.get("speaker")
+        if spk and str(spk) in mapping:
+            if "speaker_id" in seg:
+                seg["speaker_id"] = mapping[str(spk)]
+            else:
+                seg["speaker"] = mapping[str(spk)]
+    return mapping
 
 
 def transcribe_chunk_covered(chunk_path: Path, chunk_dur: float, offset: float,
@@ -1440,7 +1529,7 @@ def save_transcription(
         f"**Durée**      : {timedelta(seconds=video_info.get('duration', 0))}",
         f"**Audio**       : {audio_name}",
         f"**Modèle**      : {first_result.get('model', MISTRAL_MODEL)}",
-        f"**Langue**      : {first_result.get('language', 'auto-détectée')}",
+        f"**Langue**      : {first_result.get('language') or 'auto-détectée'}",
     ]
     if diarize:
         lines.append(f"**Diarisation** : oui")
@@ -1491,6 +1580,12 @@ def save_transcription(
         f"- Couverture segments : {timedelta(seconds=int(covered_seconds))}",
         f"- Tokens total : {total_tokens or 'N/A'}",
     ])
+    # Garde-fou : une couverture supérieure à la durée réelle du média est
+    # impossible sans segments parasites (échos de speaker_references, etc.).
+    real_dur = video_info.get("duration") or 0
+    if real_dur and covered_seconds > real_dur + COVERAGE_TOLERANCE_S:
+        lines.append(f"- ALERTE: couverture ({int(covered_seconds)} s) > durée réelle "
+                     f"({int(real_dur)} s) : segments parasites probables")
     if len(results) > 1:
         lines.append(f"- Chunks transcrits : {len(results)}")
 
@@ -1717,6 +1812,7 @@ def run_pipeline(
         transcribe_wall_start = time.monotonic()
         results = []
         speaker_references: Optional[dict[str, str]] = None
+        speaker_ref_texts: dict[str, str] = {}
         total = len(audio_files)
         acc = 0.0
         for i, (chunk_path, offset) in enumerate(audio_files, 1):
@@ -1760,7 +1856,6 @@ def run_pipeline(
                     chunk_path, chunk_dur, offset,
                     work_dir=work_dir, label=f"Chunk {i}/{total}",
                     transcribe_kwargs=transcribe_kwargs)
-                results.extend(chunk_results)
             except Exception as e:
                 if not (is_context_length_error(e) and chunk_dur >= 2 * MIN_CHUNK_SECONDS):
                     raise
@@ -1775,16 +1870,27 @@ def run_pipeline(
                 )
                 for sub_path, sub_start in sub_chunks:
                     sub_dur = get_audio_duration_seconds(sub_path)
-                    results.extend(transcribe_chunk_covered(
+                    chunk_results.extend(transcribe_chunk_covered(
                         sub_path, sub_dur, offset + sub_start,
                         work_dir=work_dir,
                         label=f"Chunk {i}/{total} sous-chunk [{format_timestamp(offset + sub_start)}]",
                         transcribe_kwargs=transcribe_kwargs))
+            # Les requêtes qui ont reçu des speaker_references peuvent renvoyer
+            # les clips eux-mêmes comme segments (écho) : on les purge, ainsi que
+            # les boucles de répétition courtes.
+            if speaker_references:
+                for r, _ in chunk_results:
+                    removed = filter_echo_segments(r, speaker_ref_texts)
+                    removed += dedupe_repeat_segments(r)
+                    if removed:
+                        _log(f"Chunk {i}/{total} : {removed} segment(s) parasite(s) supprimé(s)")
+            results.extend(chunk_results)
             # Première passe diarisé : on extrait un clip par locuteur pour
             # ancrer les labels (speaker_1 du chunk 1 = speaker_1 du chunk 7).
             if diarize and speaker_references is None and not base_url:
                 first = chunk_results[0][0] if chunk_results else {}
-                speaker_references = build_speaker_references(chunk_path, first, work_dir)
+                speaker_references, speaker_ref_texts = build_speaker_references(
+                    chunk_path, first, work_dir)
                 if speaker_references:
                     _log(f"Locuteurs ancrés via speaker_references : "
                          f"{', '.join(sorted(speaker_references))}")
@@ -1801,6 +1907,13 @@ def run_pipeline(
         model_key = f"{base_url or 'mistral'}::{model or MISTRAL_MODEL}"
         record_transcription_stats(total_audio, transcribe_elapsed,
                                    model_key=model_key)
+
+        # Labels orphelins (créés par l'API en fin de fichier malgré l'ancrage)
+        # : on les fusionne vers le locuteur qui parlait juste avant.
+        if speaker_references:
+            mapping = merge_orphan_speakers(results, set(speaker_references))
+            if mapping:
+                _log(f"Labels orphelins fusionnés : {mapping}")
 
         # --- Étape 3 : Sauvegarde (95% → 100%) ---
         _log("Sauvegarde...")
