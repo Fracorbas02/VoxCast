@@ -737,6 +737,7 @@ def transcribe_audio(
     diarize: bool = False,
     timestamp_granularities: Optional[list[str]] = None,
     context_bias: Optional[list[str]] = None,
+    speaker_references: Optional[dict[str, str]] = None,
     model: Optional[str] = None,
     base_url: Optional[str] = None,
     model_api_key: Optional[str] = None,
@@ -746,8 +747,10 @@ def transcribe_audio(
     - Sans base_url : API Mistral officielle (Mistral), modèle Voxtral.
     - Avec base_url : n'importe quel endpoint compatible OpenAI
       (ex. https://api.groq.com) avec sa propre clé (model_api_key).
-    diarize/context_bias sont spécifiques à Voxtral : ils ne sont envoyés
-    que vers l'API Mistral.
+    diarize/context_bias/speaker_references sont spécifiques à Voxtral : ils ne
+    sont envoyés que vers l'API Mistral.
+    speaker_references : {nom: audio base64} — clips de 3 à 15 s qui ancrent les
+    labels de locuteurs d'une requête à l'autre (cohérence entre chunks).
     """
     from mistralai.client import Mistral
     model = model or MISTRAL_MODEL
@@ -786,14 +789,55 @@ def transcribe_audio(
             kwargs["diarize"] = True
         if context_bias:
             kwargs["context_bias"] = context_bias
-    elif diarize or context_bias:
-        print("Note: diarisation/context bias ignorés (non supportés par cet endpoint).")
+    elif diarize or context_bias or speaker_references:
+        print("Note: diarisation/context bias/speaker_references ignorés "
+              "(non supportés par cet endpoint).")
+        speaker_references = None
+
+    # Le SDK mistralai 2.x ne connaît pas speaker_references : requête multipart
+    # construite à la main (champ JSON, comme le sérialise le SDK 3.x).
+    if speaker_references and diarize:
+        return _transcribe_with_speaker_refs(
+            mp3_path=mp3_path, api_key=api_key, model=model,
+            language=language, timestamp_granularities=timestamp_granularities,
+            context_bias=context_bias, speaker_references=speaker_references)
 
     # with : le handle est toujours fermé, même en cas d'erreur API
     with open(mp3_path, "rb") as fh:
         kwargs["file"]["content"] = fh
         response = client.audio.transcriptions.complete(**kwargs)
     return response.model_dump() if hasattr(response, "model_dump") else dict(response)
+
+
+def _transcribe_with_speaker_refs(mp3_path: Path, api_key: str, model: str,
+                                  language: Optional[str],
+                                  timestamp_granularities: Optional[list[str]],
+                                  context_bias: Optional[list[str]],
+                                  speaker_references: dict[str, str]) -> dict:
+    """POST multipart /v1/audio/transcriptions avec le champ speaker_references
+    (JSON {nom: base64}), que le SDK 2.x ne permet pas d'envoyer."""
+    import httpx
+    data: dict[str, object] = {"model": model, "diarize": "true"}
+    if language:
+        data["language"] = language
+    if timestamp_granularities:
+        data["timestamp_granularities"] = list(timestamp_granularities)
+    if context_bias:
+        data["context_bias"] = list(context_bias)
+    with open(mp3_path, "rb") as fh:
+        files = {
+            "file": (mp3_path.name, fh.read(), "audio/mpeg"),
+            # champ JSON, même format que le SDK 3.x (MultipartFormMetadata(json=True))
+            "speaker_references": (None, json.dumps(speaker_references), "application/json"),
+        }
+        resp = httpx.post(
+            "https://api.mistral.ai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            data=data, files=files, timeout=600.0,
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"API error occurred: Status {resp.status_code}. Body: {resp.text}")
+    return resp.json()
 
 
 def transcribe_with_retry(
@@ -803,6 +847,7 @@ def transcribe_with_retry(
     diarize: bool = False,
     timestamp_granularities: Optional[list[str]] = None,
     context_bias: Optional[list[str]] = None,
+    speaker_references: Optional[dict[str, str]] = None,
     max_retries: int = MAX_RETRIES,
     model: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -819,6 +864,7 @@ def transcribe_with_retry(
                 diarize=diarize,
                 timestamp_granularities=timestamp_granularities,
                 context_bias=context_bias,
+                speaker_references=speaker_references,
                 model=model,
                 base_url=base_url,
                 model_api_key=model_api_key,
@@ -855,6 +901,44 @@ def _extract_audio_segment(src: Path, dst: Path, start: float, end: float) -> No
            "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
            "-threads", "0", str(dst)]
     subprocess.run(cmd, check=True)
+
+
+# Règles des clips de référence Voxtral : 3 à 15 s, max 8 clips.
+SPEAKER_REF_MIN_S = 3.0
+SPEAKER_REF_MAX_S = 15.0
+SPEAKER_REF_MAX_CLIPS = 8
+
+
+def build_speaker_references(chunk_path: Path, result: dict,
+                             work_dir: Path) -> dict[str, str]:
+    """Construit les speaker_references {label: base64} à partir des segments
+    diarisé d'un chunk : pour chaque locuteur, on extrait le plus long de ses
+    segments (borné à 15 s, ignoré s'il fait moins de 3 s). Ces clips ancrent
+    les labels de locuteurs pour les chunks suivants."""
+    by_speaker: dict[str, list[dict]] = {}
+    for seg in result.get("segments", []) or []:
+        spk = seg.get("speaker_id") or seg.get("speaker")
+        if spk:
+            by_speaker.setdefault(str(spk), []).append(seg)
+    refs: dict[str, str] = {}
+    refs_dir = work_dir / "speaker_refs"
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    for spk, segs in by_speaker.items():
+        if len(refs) >= SPEAKER_REF_MAX_CLIPS:
+            break
+        seg = max(segs, key=lambda s: float(s.get("end", 0.0)) - float(s.get("start", 0.0)))
+        start = float(seg.get("start", 0.0))
+        dur = min(float(seg.get("end", 0.0)) - start, SPEAKER_REF_MAX_S)
+        if dur < SPEAKER_REF_MIN_S:
+            continue
+        ref_path = refs_dir / f"{sanitize_filename(spk) or 'speaker'}.mp3"
+        try:
+            _extract_audio_segment(chunk_path, ref_path, start, start + dur)
+        except Exception as e:
+            print(f"  Clip de référence '{spk}' ignoré ({e})")
+            continue
+        refs[spk] = base64.b64encode(ref_path.read_bytes()).decode("ascii")
+    return refs
 
 
 def transcribe_chunk_covered(chunk_path: Path, chunk_dur: float, offset: float,
@@ -1632,6 +1716,7 @@ def run_pipeline(
         speed = get_learned_speed()
         transcribe_wall_start = time.monotonic()
         results = []
+        speaker_references: Optional[dict[str, str]] = None
         total = len(audio_files)
         acc = 0.0
         for i, (chunk_path, offset) in enumerate(audio_files, 1):
@@ -1663,13 +1748,19 @@ def run_pipeline(
                 base_url=base_url,
                 model_api_key=model_api_key,
             )
+            # Ancre les locuteurs entre chunks : après le premier chunk diarisé,
+            # on envoie un clip de référence par locuteur (speaker_references).
+            if speaker_references:
+                transcribe_kwargs["speaker_references"] = speaker_references
+            chunk_results: list[tuple[dict, float]] = []
             try:
                 # Avec contrôle de couverture : re-transcrit le reliquat si l'API
                 # a tronqué silencieusement la génération.
-                results.extend(transcribe_chunk_covered(
+                chunk_results = transcribe_chunk_covered(
                     chunk_path, chunk_dur, offset,
                     work_dir=work_dir, label=f"Chunk {i}/{total}",
-                    transcribe_kwargs=transcribe_kwargs))
+                    transcribe_kwargs=transcribe_kwargs)
+                results.extend(chunk_results)
             except Exception as e:
                 if not (is_context_length_error(e) and chunk_dur >= 2 * MIN_CHUNK_SECONDS):
                     raise
@@ -1689,6 +1780,14 @@ def run_pipeline(
                         work_dir=work_dir,
                         label=f"Chunk {i}/{total} sous-chunk [{format_timestamp(offset + sub_start)}]",
                         transcribe_kwargs=transcribe_kwargs))
+            # Première passe diarisé : on extrait un clip par locuteur pour
+            # ancrer les labels (speaker_1 du chunk 1 = speaker_1 du chunk 7).
+            if diarize and speaker_references is None and not base_url:
+                first = chunk_results[0][0] if chunk_results else {}
+                speaker_references = build_speaker_references(chunk_path, first, work_dir)
+                if speaker_references:
+                    _log(f"Locuteurs ancrés via speaker_references : "
+                         f"{', '.join(sorted(speaker_references))}")
             elapsed = time.monotonic() - t0
             if chunk_dur > 0:
                 speed = 0.5 * speed + 0.5 * (elapsed / chunk_dur)
