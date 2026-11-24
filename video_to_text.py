@@ -875,23 +875,23 @@ def transcribe_chunk_covered(chunk_path: Path, chunk_dur: float, offset: float,
     for pass_i in range(1, MAX_COVERAGE_PASSES + 1):
         result = transcribe_with_retry(mp3_path=cur_path, **transcribe_kwargs)
         results.append((result, offset + cur_start))
-        _log(f"{label} transcrit: {len(result.get('text', ''))} caractères")
+        print(f"{label} transcrit: {len(result.get('text', ''))} caractères")
         last_end = result_last_segment_end(result)
         gap = cur_dur - last_end
         if not result.get("segments") or gap <= COVERAGE_TOLERANCE_S:
             break
         rem_start = cur_start + last_end
-        _log(f"{label} : troncature détectée à {format_timestamp(rem_start)} "
-             f"(fin du chunk : {format_timestamp(cur_start + cur_dur)}, "
-             f"reliquat {timedelta(seconds=int(gap))}) — re-transcription du reliquat "
-             f"(pass {pass_i}/{MAX_COVERAGE_PASSES})...")
+        print(f"{label} : troncature détectée à {format_timestamp(rem_start)} "
+              f"(fin du chunk : {format_timestamp(cur_start + cur_dur)}, "
+              f"reliquat {timedelta(seconds=int(gap))}) — re-transcription du reliquat "
+              f"(pass {pass_i}/{MAX_COVERAGE_PASSES})...")
         rem_path = work_dir / "chunks" / f"{cur_path.stem}_reliquat{pass_i}.mp3"
         _extract_audio_segment(cur_path, rem_path, last_end, cur_dur)
         cur_path, cur_start, cur_dur = rem_path, rem_start, gap
     else:
-        _log(f"{label} : couverture incomplète après {MAX_COVERAGE_PASSES} passes, "
-             f"dernier segment à "
-             f"{format_timestamp(offset + cur_start + result_last_segment_end(results[-1][0]))}")
+        print(f"{label} : couverture incomplète après {MAX_COVERAGE_PASSES} passes, "
+              f"dernier segment à "
+              f"{format_timestamp(offset + cur_start + result_last_segment_end(results[-1][0]))}")
     return results
 
 
